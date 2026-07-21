@@ -62,8 +62,6 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
     return;
   }
 
-  markProcessed(message.id);
-
   const classificationContext = { messageId: message.id };
   const classification = await classifyMessage(
     { subject: message.subject, senderEmail: message.from?.emailAddress.address },
@@ -71,6 +69,9 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
   );
 
   if (!classification || classification.category !== "invoice") {
+    // Classifier returned a verdict (or unparseable output) — safe to mark
+    // processed now so we don't re-classify this message on every future poll.
+    markProcessed(message.id);
     appendAuditLog({
       ...classificationContext,
       eventType: "pipeline.not_invoice",
@@ -79,8 +80,20 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
     return; // Not our concern — leave the message wherever it is.
   }
 
-  for (let attachmentIndex = 0; attachmentIndex < filterResult.pdfAttachments.length; attachmentIndex++) {
-    const invoiceId = getOrCreateInvoice(message.id, attachmentIndex);
+  // Create the durable invoices row(s) FIRST, then mark the message processed.
+  // markProcessed deliberately does NOT run before classifyMessage above: if
+  // that AI call throws (e.g. OpenRouter down after its retries exhaust), the
+  // message must stay un-marked so the next poll retries it — otherwise it
+  // would be permanently skipped with no invoices row ever created, i.e. a
+  // silently lost invoice. Creating the row before marking also means a crash
+  // in the tiny window between the two still leaves a resumable row for the
+  // next tick's in-flight scan to pick up.
+  const invoiceIds = filterResult.pdfAttachments.map((_, attachmentIndex) =>
+    getOrCreateInvoice(message.id, attachmentIndex),
+  );
+  markProcessed(message.id);
+
+  for (const invoiceId of invoiceIds) {
     await driveInvoice(invoiceId);
   }
 }
