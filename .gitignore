@@ -20,3 +20,6 @@ data/
 # OS / editor
 .DS_Store
 *.log
+
+# Private local Claude instructions (personal, never tracked)
+CLAUDE.local.md
