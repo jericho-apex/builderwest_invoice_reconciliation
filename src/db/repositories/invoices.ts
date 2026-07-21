@@ -1,0 +1,346 @@
+import { getDb } from "../client.js";
+import type { ExceptionReason } from "../../config/constants.js";
+
+// Note: classification (invoice / claim-instruction / job-note / other)
+// happens BEFORE an invoices row is created at all — every row that exists
+// has, by construction, already passed classification as "invoice", so
+// there is no separate "classified" stage to persist.
+export const STAGES = [
+  "received",
+  "extracted",
+  "matched",
+  "attachment_uploaded",
+  "ap_created",
+  "approved_pending_sync",
+  "synced",
+  "exception",
+] as const;
+
+export type Stage = (typeof STAGES)[number];
+
+/** Stages reached only after at least one Prime write has already happened. */
+const POST_WRITE_STAGES: ReadonlySet<Stage> = new Set([
+  "attachment_uploaded",
+  "ap_created",
+  "approved_pending_sync",
+  "synced",
+]);
+
+export interface ExtractedFields {
+  supplierName?: string;
+  supplierAbn?: string;
+  invoiceNumber?: string;
+  invoiceDate?: string;
+  dueDate?: string;
+  exTaxAmountCents?: number;
+  taxAmountCents?: number;
+  totalAmountCents?: number;
+  workOrderRef?: string;
+  confidence: number;
+}
+
+export interface InvoiceRecord {
+  id: number;
+  messageId: string;
+  attachmentIndex: number;
+  stage: Stage;
+  extractedSupplierName: string | null;
+  extractedSupplierAbn: string | null;
+  extractedInvoiceNumber: string | null;
+  extractedInvoiceDate: string | null;
+  extractedDueDate: string | null;
+  extractedExTaxAmountCents: number | null;
+  extractedTaxAmountCents: number | null;
+  extractedTotalAmountCents: number | null;
+  extractedWorkOrderRef: string | null;
+  extractionConfidence: number | null;
+  primeWorkOrderId: string | null;
+  primeContactId: string | null;
+  primeAttachmentId: string | null;
+  primeApInvoiceId: string | null;
+  isSynced: boolean;
+  syncedFinanceSystemName: string | null;
+  syncedFinanceSystemReference: string | null;
+  syncAttemptCount: number;
+  lastSyncCheckAt: string | null;
+  exceptionReason: ExceptionReason | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface InvoiceRow {
+  id: number;
+  message_id: string;
+  attachment_index: number;
+  stage: string;
+  extracted_supplier_name: string | null;
+  extracted_supplier_abn: string | null;
+  extracted_invoice_number: string | null;
+  extracted_invoice_date: string | null;
+  extracted_due_date: string | null;
+  extracted_ex_tax_amount_cents: number | null;
+  extracted_tax_amount_cents: number | null;
+  extracted_total_amount_cents: number | null;
+  extracted_work_order_ref: string | null;
+  extraction_confidence: number | null;
+  prime_work_order_id: string | null;
+  prime_contact_id: string | null;
+  prime_attachment_id: string | null;
+  prime_ap_invoice_id: string | null;
+  is_synced: number;
+  synced_finance_system_name: string | null;
+  synced_finance_system_reference: string | null;
+  sync_attempt_count: number;
+  last_sync_check_at: string | null;
+  exception_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function mapRow(row: InvoiceRow): InvoiceRecord {
+  return {
+    id: row.id,
+    messageId: row.message_id,
+    attachmentIndex: row.attachment_index,
+    stage: row.stage as Stage,
+    extractedSupplierName: row.extracted_supplier_name,
+    extractedSupplierAbn: row.extracted_supplier_abn,
+    extractedInvoiceNumber: row.extracted_invoice_number,
+    extractedInvoiceDate: row.extracted_invoice_date,
+    extractedDueDate: row.extracted_due_date,
+    extractedExTaxAmountCents: row.extracted_ex_tax_amount_cents,
+    extractedTaxAmountCents: row.extracted_tax_amount_cents,
+    extractedTotalAmountCents: row.extracted_total_amount_cents,
+    extractedWorkOrderRef: row.extracted_work_order_ref,
+    extractionConfidence: row.extraction_confidence,
+    primeWorkOrderId: row.prime_work_order_id,
+    primeContactId: row.prime_contact_id,
+    primeAttachmentId: row.prime_attachment_id,
+    primeApInvoiceId: row.prime_ap_invoice_id,
+    isSynced: row.is_synced === 1,
+    syncedFinanceSystemName: row.synced_finance_system_name,
+    syncedFinanceSystemReference: row.synced_finance_system_reference,
+    syncAttemptCount: row.sync_attempt_count,
+    lastSyncCheckAt: row.last_sync_check_at,
+    exceptionReason: row.exception_reason as ExceptionReason | null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function touch(id: number): void {
+  getDb()
+    .prepare("UPDATE invoices SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+    .run(id);
+}
+
+/** Creates the invoice row for a new message/attachment pair, at stage 'received'. */
+export function createInvoice(messageId: string, attachmentIndex = 0): number {
+  const result = getDb()
+    .prepare("INSERT INTO invoices (message_id, attachment_index) VALUES (?, ?)")
+    .run(messageId, attachmentIndex);
+  return Number(result.lastInsertRowid);
+}
+
+export function getInvoiceById(id: number): InvoiceRecord | undefined {
+  const row = getDb()
+    .prepare<[number], InvoiceRow>("SELECT * FROM invoices WHERE id = ?")
+    .get(id);
+  return row ? mapRow(row) : undefined;
+}
+
+export function getInvoiceByMessage(
+  messageId: string,
+  attachmentIndex = 0,
+): InvoiceRecord | undefined {
+  const row = getDb()
+    .prepare<[string, number], InvoiceRow>(
+      "SELECT * FROM invoices WHERE message_id = ? AND attachment_index = ?",
+    )
+    .get(messageId, attachmentIndex);
+  return row ? mapRow(row) : undefined;
+}
+
+/** All invoice rows for a message (normally one per PDF attachment). */
+export function getInvoicesByMessage(messageId: string): InvoiceRecord[] {
+  const rows = getDb()
+    .prepare<[string], InvoiceRow>(
+      "SELECT * FROM invoices WHERE message_id = ? ORDER BY attachment_index ASC",
+    )
+    .all(messageId);
+  return rows.map(mapRow);
+}
+
+/** Returns the existing row for this message/attachment pair, or creates a fresh one — makes per-attachment processing idempotent whether the message is brand new or reappearing after a retry. */
+export function getOrCreateInvoice(messageId: string, attachmentIndex = 0): number {
+  const existing = getInvoiceByMessage(messageId, attachmentIndex);
+  return existing ? existing.id : createInvoice(messageId, attachmentIndex);
+}
+
+/**
+ * Every invoice not yet at a terminal stage (synced or exception). Driven
+ * once per worker tick, before polling for new messages — this is what
+ * makes a crash mid-pipeline (at any stage) resumable: normal single-
+ * threaded processing always drives an invoice to a terminal stage before
+ * the tick ends, so anything found here on the next tick was orphaned by a
+ * crash and needs to be re-driven from its persisted stage.
+ */
+export function getInFlightInvoices(): InvoiceRecord[] {
+  const rows = getDb()
+    .prepare<[], InvoiceRow>("SELECT * FROM invoices WHERE stage NOT IN ('synced', 'exception')")
+    .all();
+  return rows.map(mapRow);
+}
+
+export function setStage(id: number, stage: Stage): void {
+  getDb().prepare("UPDATE invoices SET stage = ? WHERE id = ?").run(stage, id);
+  touch(id);
+}
+
+export function setExtraction(id: number, fields: ExtractedFields): void {
+  getDb()
+    .prepare(
+      `UPDATE invoices SET
+         stage = 'extracted',
+         extracted_supplier_name = @supplierName,
+         extracted_supplier_abn = @supplierAbn,
+         extracted_invoice_number = @invoiceNumber,
+         extracted_invoice_date = @invoiceDate,
+         extracted_due_date = @dueDate,
+         extracted_ex_tax_amount_cents = @exTaxAmountCents,
+         extracted_tax_amount_cents = @taxAmountCents,
+         extracted_total_amount_cents = @totalAmountCents,
+         extracted_work_order_ref = @workOrderRef,
+         extraction_confidence = @confidence
+       WHERE id = @id`,
+    )
+    .run({
+      id,
+      supplierName: fields.supplierName ?? null,
+      supplierAbn: fields.supplierAbn ?? null,
+      invoiceNumber: fields.invoiceNumber ?? null,
+      invoiceDate: fields.invoiceDate ?? null,
+      dueDate: fields.dueDate ?? null,
+      exTaxAmountCents: fields.exTaxAmountCents ?? null,
+      taxAmountCents: fields.taxAmountCents ?? null,
+      totalAmountCents: fields.totalAmountCents ?? null,
+      workOrderRef: fields.workOrderRef ?? null,
+      confidence: fields.confidence,
+    });
+  touch(id);
+}
+
+export function setResolvedMatch(
+  id: number,
+  match: { primeWorkOrderId?: string; primeContactId?: string },
+): void {
+  getDb()
+    .prepare(
+      `UPDATE invoices SET
+         stage = 'matched',
+         prime_work_order_id = COALESCE(@primeWorkOrderId, prime_work_order_id),
+         prime_contact_id = COALESCE(@primeContactId, prime_contact_id)
+       WHERE id = @id`,
+    )
+    .run({
+      id,
+      primeWorkOrderId: match.primeWorkOrderId ?? null,
+      primeContactId: match.primeContactId ?? null,
+    });
+  touch(id);
+}
+
+export function setAttachmentUploaded(id: number, primeAttachmentId: string): void {
+  getDb()
+    .prepare(
+      "UPDATE invoices SET stage = 'attachment_uploaded', prime_attachment_id = ? WHERE id = ?",
+    )
+    .run(primeAttachmentId, id);
+  touch(id);
+}
+
+export function setApInvoiceCreated(id: number, primeApInvoiceId: string): void {
+  getDb()
+    .prepare("UPDATE invoices SET stage = 'ap_created', prime_ap_invoice_id = ? WHERE id = ?")
+    .run(primeApInvoiceId, id);
+  touch(id);
+}
+
+export function setApprovedPendingSync(id: number): void {
+  setStage(id, "approved_pending_sync");
+}
+
+export function recordSyncCheckAttempt(id: number): void {
+  getDb()
+    .prepare(
+      `UPDATE invoices SET
+         sync_attempt_count = sync_attempt_count + 1,
+         last_sync_check_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       WHERE id = ?`,
+    )
+    .run(id);
+  touch(id);
+}
+
+export function setSynced(
+  id: number,
+  synced: { financeSystemName: string; financeSystemReference: string },
+): void {
+  getDb()
+    .prepare(
+      `UPDATE invoices SET
+         stage = 'synced',
+         is_synced = 1,
+         synced_finance_system_name = @financeSystemName,
+         synced_finance_system_reference = @financeSystemReference
+       WHERE id = @id`,
+    )
+    .run({ id, ...synced });
+  touch(id);
+}
+
+export function setException(id: number, reason: ExceptionReason): void {
+  getDb()
+    .prepare("UPDATE invoices SET stage = 'exception', exception_reason = ? WHERE id = ?")
+    .run(reason, id);
+  touch(id);
+}
+
+/**
+ * Resets an invoice for reprocessing after a human moves the message back to
+ * Inbox/Retry. If Prime already has a real attachment/AP invoice for this
+ * invoice (i.e. the exception happened after those writes — a persistent
+ * Xero sync failure), resume from approved_pending_sync with a fresh sync
+ * attempt budget rather than restarting the approve flow, which would
+ * otherwise create a duplicate AP invoice in Prime. Otherwise (an exception
+ * before any Prime write — no work order, cost mismatch, supplier not found,
+ * unreadable) it's safe to restart the whole pipeline from 'received', since
+ * the human's fix (correcting Prime/Outlook data) needs a fresh extraction
+ * and match pass to take effect.
+ */
+export function resetForRetry(id: number): void {
+  const invoice = getInvoiceById(id);
+  if (!invoice) {
+    throw new Error(`Cannot reset invoice ${id} for retry: no such invoice`);
+  }
+
+  const hasPrimeWrites =
+    invoice.primeApInvoiceId !== null || POST_WRITE_STAGES.has(invoice.stage);
+
+  if (hasPrimeWrites) {
+    getDb()
+      .prepare(
+        `UPDATE invoices SET
+           stage = 'approved_pending_sync',
+           exception_reason = NULL,
+           sync_attempt_count = 0
+         WHERE id = ?`,
+      )
+      .run(id);
+  } else {
+    getDb()
+      .prepare("UPDATE invoices SET stage = 'received', exception_reason = NULL WHERE id = ?")
+      .run(id);
+  }
+  touch(id);
+}
