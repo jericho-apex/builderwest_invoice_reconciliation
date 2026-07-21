@@ -1,4 +1,5 @@
 import { primeRequest } from "./httpClient.js";
+import { buildEqQuery } from "./query.js";
 import { appendAuditLog, type AuditLogInput } from "../../db/repositories/auditLog.js";
 
 export type AuditContext = Pick<AuditLogInput, "invoiceId" | "messageId">;
@@ -8,56 +9,67 @@ export interface PrimeWorkOrder {
   costCents: number;
   costTaxTotalCents: number;
   estimateId?: string;
+  jobId?: string;
 }
 
+// Prime v2 responses are JSON:API-shaped: the resource id is top-level and the
+// data fields live under `attributes` (media type application/vnd.api.v2+json).
 interface PrimeWorkOrderApiRow {
   id: string;
-  cost: number;
-  costTaxTotal: number;
-  estimateId?: string;
+  attributes: {
+    cost?: number;
+    costTaxTotal?: number;
+    estimateId?: string;
+    jobId?: string;
+  };
 }
 
 interface PrimeListResponse<T> {
   data: T[];
 }
 
-function toCents(dollars: number): number {
-  return Math.round(dollars * 100);
+function toCents(dollars: number | undefined): number {
+  return dollars === undefined ? 0 : Math.round(dollars * 100);
 }
 
 function mapWorkOrder(row: PrimeWorkOrderApiRow): PrimeWorkOrder {
   return {
     id: row.id,
-    costCents: toCents(row.cost),
-    costTaxTotalCents: toCents(row.costTaxTotal),
-    estimateId: row.estimateId,
+    // `cost` (ex-tax) is NOT documented as a work-order field — only
+    // `costTaxTotal` is. COST_FIELD defaults to costTaxTotal for this reason;
+    // costCents falls back to 0 if the field is absent (see prime-api-gaps.md).
+    costCents: toCents(row.attributes.cost),
+    costTaxTotalCents: toCents(row.attributes.costTaxTotal),
+    estimateId: row.attributes.estimateId,
+    jobId: row.attributes.jobId,
   };
 }
 
 /**
- * ASSUMPTION FLAGGED FOR VERIFICATION: the filter query param names below
- * (`filter[reference]`, `filter[jobNumber]`) are placeholders — the PRD
- * excerpt available while building this documents the work-orders object's
- * key fields (cost, costTaxTotal, estimateId) but not its query/filter
- * syntax. Confirm the real filter param names against Prime's API reference
- * before relying on these lookups; a wrong param name fails safe (no match
- * found -> routes to Exceptions/No work order) rather than silently
- * matching the wrong record, but it will misroute everything until fixed.
+ * NEEDS VENDOR CONFIRMATION: which work-order field the invoice's human-facing
+ * reference / job number maps to. Prime's docs list `estimateId`,
+ * `estimateItemId`, `estimateLabel`, `costTaxTotal` as queryable — but do NOT
+ * document a `reference` or `jobNumber` field, so the field names below are
+ * unconfirmed (see prime-api-gaps.md, open question Q1). The `q=` filter
+ * SYNTAX itself is correct. A wrong field name fails safe (no match -> routes
+ * to Exceptions/No work order) but will misroute everything until confirmed.
  */
-async function findWorkOrderByFilter(
-  filter: Record<string, string>,
+async function findWorkOrderByField(
+  field: string,
+  value: string,
   context: AuditContext,
 ): Promise<PrimeWorkOrder | undefined> {
+  const q = buildEqQuery(field, value);
   const response = await primeRequest<PrimeListResponse<PrimeWorkOrderApiRow>>({
     method: "GET",
     path: "/work-orders",
-    query: filter,
+    query: { q },
   });
 
   appendAuditLog({
     ...context,
     eventType: "prime.find_work_order",
-    detail: { filter, matchCount: response.data.length },
+    detail: { q, matchCount: response.data.length },
   });
 
   return response.data[0] ? mapWorkOrder(response.data[0]) : undefined;
@@ -67,12 +79,12 @@ export function findWorkOrderByReference(
   reference: string,
   context: AuditContext,
 ): Promise<PrimeWorkOrder | undefined> {
-  return findWorkOrderByFilter({ "filter[reference]": reference }, context);
+  return findWorkOrderByField("reference", reference, context);
 }
 
 export function findWorkOrderByJobNumber(
   jobNumber: string,
   context: AuditContext,
 ): Promise<PrimeWorkOrder | undefined> {
-  return findWorkOrderByFilter({ "filter[jobNumber]": jobNumber }, context);
+  return findWorkOrderByField("jobNumber", jobNumber, context);
 }

@@ -34,7 +34,10 @@ interface PrimeTokenResponse {
  */
 async function fetchNewToken(): Promise<PrimeToken> {
   const env = loadEnv();
-  const tokenUrl = new URL("/oauth/token", env.PRIME_BASE_URL);
+  // NB: concatenate, don't use `new URL("/oauth/token", base)` — a leading-slash
+  // path resets to the host root and drops PRIME_BASE_URL's "/api/prime/v2"
+  // path segment entirely (verified against the base URL in .env.example).
+  const tokenUrl = new URL(`${env.PRIME_BASE_URL.replace(/\/$/, "")}/oauth/token`);
 
   const body = new URLSearchParams({
     grant_type: "password",

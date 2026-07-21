@@ -1,6 +1,6 @@
 import { loadEnv } from "../../config/env.js";
 import { MAX_TRANSIENT_RETRIES } from "../../config/constants.js";
-import { retryWithBackoff } from "../queue/backoff.js";
+import { computeBackoffDelay, sleep } from "../queue/backoff.js";
 import { getPrimeAccessToken } from "./auth.js";
 import { PrimeRateLimiter } from "./rateLimiter.js";
 
@@ -14,6 +14,8 @@ export class PrimeApiError extends Error {
     message: string,
     readonly status: number,
     readonly body: unknown,
+    /** Seconds from Prime's `retry-after` header on a 429, if present. */
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
     this.name = "PrimeApiError";
@@ -46,56 +48,69 @@ interface PrimeRequestOptions {
  */
 export async function primeRequest<T>(options: PrimeRequestOptions): Promise<T> {
   const env = loadEnv();
+  // Concatenate onto the full base URL rather than `new URL(path, base)`:
+  // a leading-slash path would reset to the host root and silently drop
+  // PRIME_BASE_URL's "/api/prime/v2" segment.
+  const base = env.PRIME_BASE_URL.replace(/\/$/, "");
 
-  return retryWithBackoff(
-    async () => {
-      const release = await rateLimiter.acquire();
-      try {
-        const url = new URL(options.path, env.PRIME_BASE_URL);
-        for (const [key, value] of Object.entries(options.query ?? {})) {
-          if (value !== undefined) {
-            url.searchParams.set(key, value);
-          }
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_TRANSIENT_RETRIES; attempt++) {
+    const release = await rateLimiter.acquire();
+    try {
+      const url = new URL(`${base}${options.path}`);
+      for (const [key, value] of Object.entries(options.query ?? {})) {
+        if (value !== undefined) {
+          url.searchParams.set(key, value);
         }
-
-        const token = await getPrimeAccessToken();
-        const headers: Record<string, string> = {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.api.v2+json",
-        };
-
-        let body: BodyInit | undefined;
-        if (options.rawBody !== undefined) {
-          body = options.rawBody;
-        } else if (options.body !== undefined) {
-          headers["Content-Type"] = "application/json";
-          body = JSON.stringify(options.body);
-        }
-
-        const response = await fetch(url, {
-          method: options.method ?? "GET",
-          headers,
-          body,
-        });
-
-        if (!response.ok) {
-          const responseBody = await response.json().catch(() => undefined);
-          throw new PrimeApiError(
-            `Prime API request failed: ${options.method ?? "GET"} ${options.path} -> ${response.status}`,
-            response.status,
-            responseBody,
-          );
-        }
-
-        if (response.status === 204) {
-          return undefined as T;
-        }
-        return (await response.json()) as T;
-      } finally {
-        release();
       }
-    },
-    isRetryablePrimeError,
-    { maxAttempts: MAX_TRANSIENT_RETRIES },
-  );
+
+      const token = await getPrimeAccessToken();
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.api.v2+json",
+      };
+
+      let body: BodyInit | undefined;
+      if (options.rawBody !== undefined) {
+        body = options.rawBody;
+      } else if (options.body !== undefined) {
+        headers["Content-Type"] = "application/json";
+        body = JSON.stringify(options.body);
+      }
+
+      const response = await fetch(url, { method: options.method ?? "GET", headers, body });
+
+      if (!response.ok) {
+        const responseBody = await response.json().catch(() => undefined);
+        const retryAfterHeader = response.headers.get("retry-after");
+        throw new PrimeApiError(
+          `Prime API request failed: ${options.method ?? "GET"} ${options.path} -> ${response.status}`,
+          response.status,
+          responseBody,
+          retryAfterHeader ? Number(retryAfterHeader) : undefined,
+        );
+      }
+
+      if (response.status === 204) {
+        return undefined as T;
+      }
+      return (await response.json()) as T;
+    } catch (error) {
+      lastError = error;
+      if (!isRetryablePrimeError(error) || attempt === MAX_TRANSIENT_RETRIES - 1) {
+        throw error;
+      }
+      // Prime documents a `retry-after` header on 429 — honor it in preference
+      // to a blind exponential delay when present (matches the Graph client).
+      const delayMs =
+        error instanceof PrimeApiError && error.retryAfterSeconds !== undefined
+          ? error.retryAfterSeconds * 1000
+          : computeBackoffDelay(attempt);
+      await sleep(delayMs);
+    } finally {
+      release();
+    }
+  }
+
+  throw lastError;
 }
