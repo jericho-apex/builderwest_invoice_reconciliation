@@ -64,7 +64,15 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
 
   const classificationContext = { messageId: message.id };
   const classification = await classifyMessage(
-    { subject: message.subject, senderEmail: message.from?.emailAddress.address },
+    {
+      subject: message.subject,
+      senderEmail: message.from?.emailAddress.address,
+      bodyPreview: message.bodyPreview,
+      // The pre-filter has already fetched these, so naming them here is free —
+      // and a filename like "Invoice_12345.pdf" is often the strongest signal on
+      // an email whose subject is nothing but a PO number.
+      attachmentFilenames: filterResult.pdfAttachments.map((attachment) => attachment.name),
+    },
     classificationContext,
   );
 
