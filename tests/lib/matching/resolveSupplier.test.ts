@@ -8,6 +8,14 @@ vi.mock("../../../src/lib/prime/contacts.js", () => ({
   findContactsByName: (...args: unknown[]) => findContactsByName(...args),
 }));
 
+// Stubbed rather than driven through real env vars so a test can flip the flag
+// mid-file — loadEnv() caches on first call and would otherwise pin whichever
+// value the first test happened to use.
+let assumeSupplierMatched = false;
+vi.mock("../../../src/config/env.js", () => ({
+  loadEnv: () => ({ ASSUME_SUPPLIER_MATCHED: assumeSupplierMatched }),
+}));
+
 const { resolveSupplier } = await import("../../../src/lib/matching/resolveSupplier.js");
 
 const context = { messageId: "msg-1" };
@@ -19,6 +27,7 @@ describe("resolveSupplier", () => {
   beforeEach(() => {
     findContactsByAbn.mockReset();
     findContactsByName.mockReset();
+    assumeSupplierMatched = false;
   });
 
   it("matches by ABN first and never falls back to name when the ABN hits", async () => {
@@ -101,5 +110,58 @@ describe("resolveSupplier", () => {
     expect(result).toEqual({ status: "not_found" });
     expect(findContactsByAbn).not.toHaveBeenCalled();
     expect(findContactsByName).not.toHaveBeenCalled();
+  });
+
+  // ASSUME_SUPPLIER_MATCHED exists only because production Prime holds four
+  // contacts named "Ryan Smith", so the client's own auto-approve invoice cannot
+  // resolve a supplier. It must change what an UNRESOLVED result means and
+  // nothing else — never which lookups run, never a genuine match.
+  describe("with ASSUME_SUPPLIER_MATCHED on", () => {
+    beforeEach(() => {
+      assumeSupplierMatched = true;
+    });
+
+    it("assumes the supplier when several contacts share the name, reporting how many", async () => {
+      findContactsByName.mockResolvedValue([ryan, tobey]);
+
+      const result = await resolveSupplier({ abn: null, name: "Ryan Smith" }, context);
+
+      expect(result).toEqual({ status: "assumed", candidateCount: 2 });
+      // Still asked Prime — the flag forgives the answer, it does not skip the question.
+      expect(findContactsByName).toHaveBeenCalledWith("Ryan Smith", context);
+    });
+
+    it("assumes the supplier when Prime has nobody by that name", async () => {
+      findContactsByName.mockResolvedValue([]);
+
+      const result = await resolveSupplier({ abn: null, name: "Unknown Co" }, context);
+
+      expect(result).toEqual({ status: "assumed", candidateCount: 0 });
+    });
+
+    it("still reports a genuine single name match as matched_by_name", async () => {
+      findContactsByName.mockResolvedValue([tobey]);
+
+      const result = await resolveSupplier({ abn: null, name: "Tobey Chan" }, context);
+
+      expect(result).toEqual({ status: "matched_by_name", contact: tobey });
+    });
+
+    it("still prefers a genuine ABN match over assuming", async () => {
+      findContactsByAbn.mockResolvedValue([ryan]);
+
+      const result = await resolveSupplier({ abn: VALID_ABN, name: "Ryan Smith" }, context);
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: ryan });
+      expect(findContactsByName).not.toHaveBeenCalled();
+    });
+
+    it("assumes without a contact — there is no verified one to hand back", async () => {
+      findContactsByName.mockResolvedValue([ryan, tobey]);
+
+      const result = await resolveSupplier({ abn: null, name: "Ryan Smith" }, context);
+
+      expect(result).not.toHaveProperty("contact");
+    });
   });
 });

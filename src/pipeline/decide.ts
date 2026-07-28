@@ -35,8 +35,9 @@ export type MatchDecision =
   | {
       outcome: "approve";
       workOrder: PrimeWorkOrder;
-      contact: PrimeContact;
-      supplierMatchStatus: "matched_by_abn" | "matched_by_name";
+      /** Absent only when supplierMatchStatus is "assumed" — there is no verified contact to report. */
+      contact?: PrimeContact;
+      supplierMatchStatus: "matched_by_abn" | "matched_by_name" | "assumed";
       cost: CostComparisonResult;
       matchResult: MatchResultPayload;
       auditEvents: DecisionAuditEvent[];
@@ -129,6 +130,27 @@ export async function decideMatch(
     };
   }
 
+  // ASSUME_SUPPLIER_MATCHED reached here: the supplier did not resolve and we
+  // are continuing anyway, so say so in the audit trail. Without this row the
+  // only trace is a match_results status, and a reader reconstructing why an
+  // invoice was approved would have no record of what was skipped or why.
+  const supplierAuditEvents: DecisionAuditEvent[] =
+    supplierResolution.status === "assumed"
+      ? [
+          {
+            eventType: "pipeline.supplier_assumed",
+            detail: {
+              supplierName: fields.supplierName,
+              supplierAbn: fields.supplierAbn,
+              nameCandidateCount: supplierResolution.candidateCount,
+              workOrderId: workOrder.id,
+            },
+          },
+        ]
+      : [];
+
+  const contact = supplierResolution.status === "assumed" ? undefined : supplierResolution.contact;
+
   const env = loadEnv();
   const cost = compareCost(
     fields.totalAmountCents,
@@ -142,7 +164,7 @@ export async function decideMatch(
     workOrderMatchStatus: "matched",
     workOrderId: workOrder.id,
     supplierMatchStatus: supplierResolution.status,
-    supplierContactId: supplierResolution.contact.id,
+    supplierContactId: contact?.id,
     costFieldUsed: cost.costField,
     invoiceTotalCents: cost.invoiceTotalCents,
     workOrderCostCents: cost.workOrderCostCents,
@@ -154,7 +176,7 @@ export async function decideMatch(
       outcome: "exception",
       reason: "costMismatch",
       workOrder,
-      contact: supplierResolution.contact,
+      contact,
       cost,
       matchResult: {
         ...costColumns,
@@ -162,14 +184,14 @@ export async function decideMatch(
         decision: "exception",
         exceptionReason: "costMismatch",
       },
-      auditEvents: [],
+      auditEvents: supplierAuditEvents,
     };
   }
 
   return {
     outcome: "approve",
     workOrder,
-    contact: supplierResolution.contact,
+    contact,
     supplierMatchStatus: supplierResolution.status,
     cost,
     matchResult: {
@@ -177,6 +199,6 @@ export async function decideMatch(
       withinTolerance: true,
       decision: "approve",
     },
-    auditEvents: [],
+    auditEvents: supplierAuditEvents,
   };
 }

@@ -179,7 +179,10 @@ export async function driveInvoice(invoiceId: number): Promise<void> {
 
       setResolvedMatch(invoiceId, {
         primeWorkOrderId: decision.workOrder.id,
-        primeContactId: decision.contact.id,
+        // Undefined under ASSUME_SUPPLIER_MATCHED — no contact was verified, and
+        // recording a guessed one would misrepresent the run. setResolvedMatch
+        // COALESCEs, so the column simply stays null.
+        primeContactId: decision.contact?.id,
       });
     }
 

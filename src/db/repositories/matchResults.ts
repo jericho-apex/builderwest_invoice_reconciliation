@@ -10,9 +10,14 @@ export type WorkOrderMatchStatus = "matched" | "not_found" | "ambiguous";
 // "not_found" for a lookup that never happened is the kind of wrong signal this pilot
 // exists to avoid — a human triaging Exceptions/No work order would otherwise conclude
 // the supplier is missing from Prime on no evidence at all.
+// "assumed" = ASSUME_SUPPLIER_MATCHED was on and the supplier did NOT resolve;
+// the invoice was allowed past the supplier check anyway. Recorded distinctly
+// so a row that was never really matched can never be read back as one — it is
+// the only status with no supplier_contact_id alongside a non-exception decision.
 export type SupplierMatchStatus =
   | "matched_by_abn"
   | "matched_by_name"
+  | "assumed"
   | "not_found"
   | "not_attempted";
 export type Decision = "approve" | "exception";
