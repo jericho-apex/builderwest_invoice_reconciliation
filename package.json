@@ -8,10 +8,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "tsx watch src/worker/index.ts",
+    "dev": "tsx watch --env-file-if-exists=.env.local src/worker/index.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/worker/index.js",
-    "db:migrate": "tsx src/db/migrate.ts",
+    "start": "node --env-file-if-exists=.env.local dist/worker/index.js",
+    "db:migrate": "tsx --env-file-if-exists=.env.local src/db/migrate.ts",
     "extract:sample": "tsx --env-file-if-exists=.env.local scripts/extract-sample.ts",
     "pipeline:sample": "tsx --env-file-if-exists=.env.local scripts/pipeline-sample.ts",
     "test": "vitest run",
