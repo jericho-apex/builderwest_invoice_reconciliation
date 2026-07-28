@@ -7,7 +7,9 @@ export type AuditContext = Pick<AuditLogInput, "invoiceId" | "messageId">;
 
 export interface PrimeWorkOrder {
   id: string;
-  costCents: number;
+  /** Ex-GST cost total. */
+  costTotalCents: number;
+  /** The GST portion ONLY — not a tax-inclusive total. See mapWorkOrder. */
   costTaxTotalCents: number;
   estimateId?: string;
   jobId?: string;
@@ -15,11 +17,14 @@ export interface PrimeWorkOrder {
 
 // Prime v2 responses are JSON:API-shaped: the resource id is top-level and the
 // data fields live under `attributes` (media type application/vnd.api.v2+json).
+//
+// Amounts arrive in DOLLARS and inconsistently typed — `costTotal` as a JSON
+// number, `costTaxTotal` as a decimal string ("43.50") — hence the union below.
 interface PrimeWorkOrderApiRow {
   id: string;
   attributes: {
-    cost?: number;
-    costTaxTotal?: number;
+    costTotal?: number | string;
+    costTaxTotal?: number | string;
     estimateId?: string;
     jobId?: string;
   };
@@ -29,17 +34,38 @@ interface PrimeListResponse<T> {
   data: T[];
 }
 
-function toCents(dollars: number | undefined): number {
-  return dollars === undefined ? 0 : Math.round(dollars * 100);
+/**
+ * Dollars (number or decimal string) -> integer cents.
+ *
+ * An absent or unparseable amount becomes 0 rather than throwing. That is
+ * deliberate: 0 can only ever produce a cost MISMATCH, which routes the invoice
+ * to a human, whereas throwing would leave the invoice stuck being retried
+ * every tick. Nothing here can widen what counts as a match.
+ */
+function toCents(dollars: number | string | undefined): number {
+  if (dollars === undefined || dollars === null) {
+    return 0;
+  }
+  const value = typeof dollars === "string" ? Number(dollars) : dollars;
+  return Number.isFinite(value) ? Math.round(value * 100) : 0;
 }
 
+/**
+ * VERIFIED LIVE 2026-07-28 against production Prime. A work order carries
+ * `costTotal` (ex-GST, e.g. 435 on PO21266) and `costTaxTotal` (the GST amount
+ * ONLY, e.g. "43.50") — there is no `cost` field, and `costTaxTotal` is NOT a
+ * tax-inclusive total despite the name. The inc-GST figure a supplier invoice
+ * prints is the sum of the two ($478.50), which is what COST_FIELD's default
+ * `costTotalIncTax` compares against; see matching/compareCost.ts.
+ *
+ * The earlier reading of this — `cost` for ex-tax, `costTaxTotal` for inc-tax —
+ * silently compared invoice totals against a GST amount, so a correct invoice
+ * could never match.
+ */
 function mapWorkOrder(row: PrimeWorkOrderApiRow): PrimeWorkOrder {
   return {
     id: row.id,
-    // `cost` (ex-tax) is NOT documented as a work-order field — only
-    // `costTaxTotal` is. COST_FIELD defaults to costTaxTotal for this reason;
-    // costCents falls back to 0 if the field is absent (see prime-api-gaps.md).
-    costCents: toCents(row.attributes.cost),
+    costTotalCents: toCents(row.attributes.costTotal),
     costTaxTotalCents: toCents(row.attributes.costTaxTotal),
     estimateId: row.attributes.estimateId,
     jobId: row.attributes.jobId,

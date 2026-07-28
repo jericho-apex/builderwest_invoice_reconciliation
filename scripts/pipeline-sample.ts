@@ -44,16 +44,21 @@ import { fileURLToPath } from "node:url";
 // that way, or move these into a separate module imported first.
 //
 // The cost config is pinned rather than inherited: a developer with
-// COST_FIELD=cost in their environment would otherwise see all three invoices
-// mismatch (Prime omits the ex-tax field, mapWorkOrder falls back to 0) and
-// conclude the pipeline is broken.
+// COST_FIELD=costTotal in their environment would otherwise see invoice 1
+// mismatch by exactly its GST and conclude the pipeline is broken.
+//
+// ASSUME_SUPPLIER_MATCHED is pinned OFF for the same reason in reverse — this
+// script's whole point is proving the supplier resolves by NAME, which the flag
+// would paper over. The real duplicate-contact problem lives in production
+// Prime, not in the fake, so the fixtures resolve cleanly either way.
 // ---------------------------------------------------------------------------
 process.env.DB_PATH = join(mkdtempSync(join(tmpdir(), "bw-pipeline-sample-")), "app.db");
 process.env.PRIME_DRY_RUN = "true";
-process.env.COST_FIELD = "costTaxTotal";
+process.env.COST_FIELD = "costTotalIncTax";
 process.env.COST_TOLERANCE_MODE = "exact";
 process.env.COST_TOLERANCE_VALUE = "0";
 process.env.PRIME_WORK_ORDER_PO_FIELD = "purchaseOrderNumber";
+process.env.ASSUME_SUPPLIER_MATCHED = "false";
 
 import { loadEnv } from "../src/config/env.js";
 import { EXTRACTION_CONFIDENCE_THRESHOLD, EXCEPTION_FOLDERS } from "../src/config/constants.js";

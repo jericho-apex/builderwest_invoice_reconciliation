@@ -20,7 +20,10 @@ process.env.PRIME_USERNAME = "test";
 process.env.PRIME_PASSWORD = "test";
 process.env.COST_TOLERANCE_MODE = "exact";
 process.env.COST_TOLERANCE_VALUE = "0";
-process.env.COST_FIELD = "costTaxTotal";
+process.env.COST_FIELD = "costTotalIncTax";
+// Off, so the exactly-one-match supplier rule is what these tests exercise. The
+// one test that needs it on sets it per-case and restores it.
+process.env.ASSUME_SUPPLIER_MATCHED = "false";
 process.env.GRAPH_TENANT_ID = "test";
 process.env.GRAPH_CLIENT_ID = "test";
 process.env.GRAPH_CLIENT_SECRET = "test";
@@ -117,8 +120,8 @@ const PDF_ATTACHMENT = {
   contentBytes: Buffer.from("%PDF-1.4 fake").toString("base64"),
 };
 
-// Dummy invoice 1: $478.50 inc GST, matching the Stage 1 work order's
-// costTaxTotal exactly.
+// Dummy invoice 1: $478.50 inc GST, matching the Stage 1 work order's ex-GST
+// cost plus its GST ($435.00 + $43.50) exactly.
 const CLEAN_EXTRACTION = {
   supplierName: "Ryan Smith",
   supplierAbn: "00 000 000 000",
@@ -136,16 +139,16 @@ const CLEAN_EXTRACTION = {
 
 const MATCHING_WORK_ORDER = {
   id: "wo_po21266",
-  costCents: 43_500,
-  costTaxTotalCents: 47_850,
+  costTotalCents: 43_500,
+  costTaxTotalCents: 4_350,
 };
 
 // Stage 2 of the same job — the work order an invoice must never be matched to
 // by accident.
 const SIBLING_WORK_ORDER = {
   id: "wo_po21267",
-  costCents: 70_500,
-  costTaxTotalCents: 77_550,
+  costTotalCents: 40_500,
+  costTaxTotalCents: 4_050,
 };
 
 const MATCHING_CONTACT = { id: "contact_ryan", name: "Ryan Smith" };
@@ -450,12 +453,13 @@ describe("the three client dummy invoices", () => {
 
     await processMessage(message);
 
-    // The recorded comparison must be $775.50 against PO21267's own work order
-    // cost. If the finder were unkeyed it would silently compare against Stage 1
-    // ($478.50) and "cost mismatch" would prove nothing about the amount.
+    // The recorded comparison must be $775.50 against PO21267's own inc-GST cost
+    // ($405.00 + $40.50 = $445.50, the real production figures). If the finder
+    // were unkeyed it would silently compare against Stage 1 ($478.50) and "cost
+    // mismatch" would prove nothing about the amount.
     const matchResult = latestMatchResult(getInvoiceByMessage(message.id)!.id);
     expect(matchResult.invoice_total_cents).toBe(77_550);
-    expect(matchResult.work_order_cost_cents).toBe(60_500);
+    expect(matchResult.work_order_cost_cents).toBe(44_550);
   });
 
   it("never queries Prime by the placeholder ABN for any of the three", async () => {

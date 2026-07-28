@@ -71,9 +71,22 @@ Two traps worth knowing before changing extraction or matching:
   resolve by name. Any `'abn'.eq(...)` query reaching Prime is a failure, and
   both the test block and `pipeline:sample` assert none is sent.
 
-PO21267's true `costTaxTotal` in Prime is **unknown** — the fixture uses a
-flagged placeholder ($605.00). The routing proof holds for any value ≠ $775.50,
-but confirm the real figure with the client.
+Both work orders' figures are now the real ones, read from production Prime on
+2026-07-28: PO21266 is `costTotal` $435.00 + `costTaxTotal` $43.50 = **$478.50**
+inc GST (invoice 1 matches to the cent), PO21267 is $405.00 + $40.50 =
+**$445.50** against invoice 2's $775.50. The invented $605.00 placeholder is
+retired.
+
+**What blocks a live E2E run today.** Production Prime holds **four** contacts
+named `Ryan Smith` (one `User`, one `Client`, two `Customer`), so invoice 1's
+supplier cannot resolve under the exactly-one-match rule and it exits at
+`supplierNotFound` before cost is ever checked. `ASSUME_SUPPLIER_MATCHED=true`
+(see below) is the test-run device for getting past that; the real fix is the
+client deduping, or resolving the supplier from the work order's `assignedId`,
+which already points at the right contact on both dummy work orders. Note also
+that all three dummy "suppliers" are Builderwest staff (`contactType: User`,
+`@builderwest.com.au`), so this data does not exercise supplier matching the way
+production will.
 
 ## Critical operational context
 
@@ -88,6 +101,15 @@ production environment. Two things make development safe without one:
   used only once dry-run is off for live write-path testing, and only with
   written authorization and an agreed cleanup process. **Never point this at a
   real customer work order.**
+
+`ASSUME_SUPPLIER_MATCHED=true` is a **test-run-only** third switch: an invoice
+whose supplier does not resolve to exactly one Prime contact continues to the
+cost check as `"assumed"` instead of routing to `Exceptions/Supplier not found`.
+It records a `pipeline.supplier_assumed` audit row, persists no
+`prime_contact_id` (there is no verified contact to persist), and `loadEnv()`
+**refuses to start** if it is combined with `PRIME_DRY_RUN=false` — the one
+combination that could approve a real AP invoice against an unverified supplier.
+It must never be set on Render.
 
 Deploys as a Render **Background Worker** (long-running Node process with an
 internal poll loop, not a Cron Job) with a persistent disk for the SQLite file.
@@ -198,10 +220,17 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   names, so trusting it would resolve both to the same contact. **Across both,
   the rule is exactly-one-match: zero matches and several matches are equally
   unresolved, never `data[0]`** — which is why the Prime finders return arrays.
+  The single exception is `ASSUME_SUPPLIER_MATCHED`, which converts an unresolved
+  supplier into `"assumed"` for a test run; it never changes which lookups run,
+  and never overrides a genuine match.
   `compareCost` (integer-cents
   comparison against `COST_FIELD`/`COST_TOLERANCE_MODE`/`COST_TOLERANCE_VALUE`
   from env — a tighter tolerance only ever sends more items to review, never
-  widens what counts as a match).
+  widens what counts as a match). A Prime work order carries `costTotal` (ex-GST)
+  and `costTaxTotal` (**the GST amount alone**, despite the name) and no `cost`
+  field at all, so `COST_FIELD` defaults to `costTotalIncTax`, which sums the two
+  in cents to get the inc-GST figure an invoice actually prints. That settles
+  PRD §9.6 — the API answered it, not the client.
 - `queue/` — `taskQueue.ts`'s `runWithConcurrency` (app-level concurrency,
   independent of Prime's own limiter) and `backoff.ts`'s retry helper.
 

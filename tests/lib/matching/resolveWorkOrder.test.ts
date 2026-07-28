@@ -9,8 +9,9 @@ vi.mock("../../../src/lib/prime/workOrders.js", () => ({
 const { resolveWorkOrder } = await import("../../../src/lib/matching/resolveWorkOrder.js");
 
 const context = { messageId: "msg-1" };
-const stage1 = { id: "wo_stage_1", costCents: 43_500, costTaxTotalCents: 47_850 };
-const stage2 = { id: "wo_stage_2", costCents: 70_500, costTaxTotalCents: 77_550 };
+// Ex-GST cost + its GST, as mapWorkOrder returns them.
+const stage1 = { id: "wo_stage_1", costTotalCents: 43_500, costTaxTotalCents: 4_350 };
+const stage2 = { id: "wo_stage_2", costTotalCents: 40_500, costTaxTotalCents: 4_050 };
 
 describe("resolveWorkOrder", () => {
   beforeEach(() => {
