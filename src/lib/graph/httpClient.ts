@@ -41,7 +41,15 @@ export async function graphRequest<T>(options: GraphRequestOptions): Promise<T> 
 
   for (let attempt = 0; attempt < MAX_TRANSIENT_RETRIES; attempt++) {
     try {
-      const url = new URL(options.path, GRAPH_BASE_URL);
+      // Concatenate onto the full base URL rather than `new URL(path, base)`:
+      // paths start with "/", which that form treats as root-relative and so
+      // silently drops GRAPH_BASE_URL's "/v1.0" segment — Graph then answers
+      // 404 "Invalid version: users". Same trap as prime/httpClient.ts.
+      // Pagination passes @odata.nextLink through as an already-absolute URL
+      // (see mailbox.ts), so that case must bypass the base entirely.
+      const url = /^https?:\/\//.test(options.path)
+        ? new URL(options.path)
+        : new URL(`${GRAPH_BASE_URL}${options.path}`);
       for (const [key, value] of Object.entries(options.query ?? {})) {
         if (value !== undefined) {
           url.searchParams.set(key, value);
