@@ -15,12 +15,20 @@ const envSchema = z.object({
   PRIME_TEST_WORK_ORDER_ID: z.string().optional(),
 
   // Which queryable work-order field holds the purchase order number printed
-  // on a supplier invoice. UNCONFIRMED — Prime's v2 docs do not list a PO
-  // field (prime-api-gaps.md Q1), and this is now the ONLY key work-order
-  // matching uses, so a wrong name means nothing ever matches. Kept as config
-  // (like COST_FIELD) so the vendor's answer needs no code change. Fails safe:
-  // a bad field name yields zero matches -> Exceptions/No work order.
-  PRIME_WORK_ORDER_PO_FIELD: z.string().min(1).default("purchaseOrderNumber"),
+  // on a supplier invoice. Prime's v2 docs list no `purchaseOrderNumber` field
+  // (prime-api-gaps.md Q1) — verified live 2026-07-28 against production: the
+  // PO number lives in the work order's `label`, and `'label'.eq(...)` returns
+  // exactly one work order for PO21266 and PO21267 and zero for PO99999.
+  //
+  // Does NOT fail safe: querying a field Prime doesn't recognise returns a
+  // 500, not an empty result set, so a wrong name here throws (after retries)
+  // rather than routing to Exceptions/No work order.
+  //
+  // STILL FOR THE CLIENT: label format is inconsistent in production — the
+  // dummy invoices' work orders are labelled "PO21266", but most rows are
+  // labelled with a bare number ("17651"). An invoice printing "PO17651"
+  // would not match a work order labelled "17651" under an exact-match query.
+  PRIME_WORK_ORDER_PO_FIELD: z.string().min(1).default("label"),
 
   COST_TOLERANCE_MODE: z.enum(["exact", "dollar", "percentage"]).default("exact"),
   COST_TOLERANCE_VALUE: z.coerce.number().default(0),
