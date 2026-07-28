@@ -9,6 +9,8 @@ export interface GraphMessageSummary {
   receivedDateTime: string;
   subject: string;
   hasAttachments: boolean;
+  /** Graph's truncated body preview — evidence for classification, never for extraction. */
+  bodyPreview?: string;
   from?: { emailAddress: { address: string; name?: string } };
 }
 
@@ -35,7 +37,11 @@ const FIRST_RUN_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 // Graph indexing lag — overlap is harmless, processed_messages dedupes it.
 const CHECKPOINT_SAFETY_BUFFER_MS = 15 * 60 * 1000;
 
-const MESSAGE_SELECT_FIELDS = "id,receivedDateTime,subject,from,hasAttachments";
+// bodyPreview is here for the classifier: subject + sender alone is too little
+// to tell an invoice from a job note, and Graph returns the preview on the list
+// call for free (it is a truncated ~255-char string, not the full body, so it
+// costs nothing extra to select).
+const MESSAGE_SELECT_FIELDS = "id,receivedDateTime,subject,from,hasAttachments,bodyPreview";
 
 async function listAllMessages(
   folderId: string,
@@ -101,8 +107,20 @@ export async function pollForNewMessages(): Promise<PollResult> {
   const inboxFilter = `receivedDateTime gt ${since.toISOString()} and hasAttachments eq true`;
   const inboxMessages = await listAllMessages("inbox", inboxFilter);
 
+  // The Retry listing sends NO $filter, and screens for attachments in code.
+  //
+  // Graph answers 400 InefficientFilter to `$filter=hasAttachments eq true`
+  // combined with `$orderby=receivedDateTime`: when the two are combined, the
+  // ordered property must also be constrained by the filter so the store can
+  // use an index. The Inbox poll satisfies that via its `receivedDateTime gt`
+  // checkpoint; a Retry listing has no checkpoint clause to satisfy it with, so
+  // the same shape is rejected. Dropping $orderby instead would work, but the
+  // ordering is worth more than a server-side test on a folder that is listed
+  // in full anyway precisely because it should be near-empty.
   const retryFolderId = await getOrCreateFolderId(RETRY_FOLDER);
-  const retryMessages = await listAllMessages(retryFolderId, "hasAttachments eq true");
+  const retryMessages = (await listAllMessages(retryFolderId, undefined)).filter(
+    (message) => message.hasAttachments,
+  );
 
   return { inboxMessages, retryMessages };
 }
