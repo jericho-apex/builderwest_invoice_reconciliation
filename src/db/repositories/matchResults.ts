@@ -14,9 +14,14 @@ export type WorkOrderMatchStatus = "matched" | "not_found" | "ambiguous";
 // the invoice was allowed past the supplier check anyway. Recorded distinctly
 // so a row that was never really matched can never be read back as one — it is
 // the only status with no supplier_contact_id alongside a non-exception decision.
+// "matched_by_assignment" = several contacts shared the invoice's supplier name
+// and exactly one of them was the contact the work order is assigned to. A real
+// match, but recorded distinctly so a tie that was broken never reads as a name
+// that was unambiguous.
 export type SupplierMatchStatus =
   | "matched_by_abn"
   | "matched_by_name"
+  | "matched_by_assignment"
   | "assumed"
   | "not_found"
   | "not_attempted";

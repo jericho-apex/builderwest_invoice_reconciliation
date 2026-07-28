@@ -112,6 +112,84 @@ describe("resolveSupplier", () => {
     expect(findContactsByName).not.toHaveBeenCalled();
   });
 
+  // Builderwest's production Prime holds four contacts named "Ryan Smith", so
+  // their own auto-approve invoice cannot resolve by name alone. The matched
+  // work order is assigned to exactly one of them, which breaks the tie.
+  describe("work-order assignment tie-break", () => {
+    const ryanUser = { id: "contact_ryan_user", name: "Ryan Smith" };
+    const ryanClient = { id: "contact_ryan_client", name: "Ryan Smith" };
+    const ryanCustomer = { id: "contact_ryan_customer", name: "Ryan Smith" };
+
+    it("resolves to the contact the work order is assigned to", async () => {
+      findContactsByName.mockResolvedValue([ryanUser, ryanClient, ryanCustomer]);
+
+      const result = await resolveSupplier(
+        { abn: null, name: "Ryan Smith", workOrderAssignedId: "contact_ryan_user" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "matched_by_assignment", contact: ryanUser });
+    });
+
+    // The property that makes this not a dressed-up data[0]: the tie-break can
+    // only choose among contacts the INVOICE named. An assignee whose name is
+    // nothing like the supplier on the invoice must never be selected.
+    it("does not select an assignee whose name the invoice never mentioned", async () => {
+      findContactsByName.mockResolvedValue([ryanUser, ryanClient]);
+
+      const result = await resolveSupplier(
+        { abn: null, name: "Ryan Smith", workOrderAssignedId: "contact_someone_else" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "not_found" });
+    });
+
+    // No name match means no corroboration at all — the assignment alone is not
+    // evidence that this work order's assignee sent this invoice.
+    it("never fires when the name matched nobody", async () => {
+      findContactsByName.mockResolvedValue([]);
+
+      const result = await resolveSupplier(
+        { abn: null, name: "Unknown Co", workOrderAssignedId: "contact_ryan_user" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "not_found" });
+    });
+
+    it("leaves an unambiguous single name match reported as matched_by_name", async () => {
+      findContactsByName.mockResolvedValue([tobey]);
+
+      const result = await resolveSupplier(
+        { abn: null, name: "Tobey Chan", workOrderAssignedId: "contact_ryan_user" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "matched_by_name", contact: tobey });
+    });
+
+    it("stays unresolved when the work order has no assignee to break the tie with", async () => {
+      findContactsByName.mockResolvedValue([ryanUser, ryanClient]);
+
+      const result = await resolveSupplier({ abn: null, name: "Ryan Smith" }, context);
+
+      expect(result).toEqual({ status: "not_found" });
+    });
+
+    it("still prefers a genuine ABN match over the tie-break", async () => {
+      findContactsByAbn.mockResolvedValue([ryanClient]);
+
+      const result = await resolveSupplier(
+        { abn: VALID_ABN, name: "Ryan Smith", workOrderAssignedId: "contact_ryan_user" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: ryanClient });
+      expect(findContactsByName).not.toHaveBeenCalled();
+    });
+  });
+
   // ASSUME_SUPPLIER_MATCHED exists only because production Prime holds four
   // contacts named "Ryan Smith", so the client's own auto-approve invoice cannot
   // resolve a supplier. It must change what an UNRESOLVED result means and

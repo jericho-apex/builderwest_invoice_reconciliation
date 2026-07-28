@@ -13,6 +13,12 @@ export interface PrimeWorkOrder {
   costTaxTotalCents: number;
   estimateId?: string;
   jobId?: string;
+  /**
+   * The contact this work order is assigned to. Used by resolveSupplier ONLY to
+   * break a tie between contacts that already match the invoice's supplier name
+   * — never as a supplier lookup in its own right.
+   */
+  assignedId?: string;
 }
 
 // Prime v2 responses are JSON:API-shaped: the resource id is top-level and the
@@ -27,6 +33,7 @@ interface PrimeWorkOrderApiRow {
     costTaxTotal?: number | string;
     estimateId?: string;
     jobId?: string;
+    assignedId?: string;
   };
 }
 
@@ -69,6 +76,7 @@ function mapWorkOrder(row: PrimeWorkOrderApiRow): PrimeWorkOrder {
     costTaxTotalCents: toCents(row.attributes.costTaxTotal),
     estimateId: row.attributes.estimateId,
     jobId: row.attributes.jobId,
+    assignedId: row.attributes.assignedId,
   };
 }
 

@@ -317,6 +317,48 @@ describe("dry-run pipeline (no Prime writes)", () => {
     expect(matchResult.work_order_match_status).toBe("ambiguous");
   });
 
+  // Builderwest's live case, reproduced offline: four contacts named "Ryan
+  // Smith", and the matched work order assigned to one of them. Without the
+  // tie-break their own auto-approve invoice cannot resolve a supplier at all.
+  it("four same-name contacts + an assigned work order -> approved, tie broken by assignment", async () => {
+    findWorkOrdersByPurchaseOrder.mockResolvedValue([
+      { ...MATCHING_WORK_ORDER, assignedId: "contact_ryan_user" },
+    ]);
+    findContactsByName.mockResolvedValue([
+      { id: "contact_ryan_user", name: "Ryan Smith" },
+      { id: "contact_ryan_client", name: "Ryan Smith" },
+      { id: "contact_ryan_customer_1", name: "Ryan Smith" },
+      { id: "contact_ryan_customer_2", name: "Ryan Smith" },
+    ]);
+    const message = makeMessage();
+
+    await processMessage(message);
+
+    const invoice = getInvoiceByMessage(message.id)!;
+    expect(invoice.stage).toBe("synced");
+    expect(invoice.primeContactId).toBe("contact_ryan_user");
+    expect(latestMatchResult(invoice.id).supplier_match_status).toBe("matched_by_assignment");
+    expect(moveMessage).toHaveBeenCalledWith(message.id, PROCESSED_FOLDER, expect.anything());
+  });
+
+  it("four same-name contacts but the work order is assigned elsewhere -> Supplier not found", async () => {
+    findWorkOrdersByPurchaseOrder.mockResolvedValue([
+      { ...MATCHING_WORK_ORDER, assignedId: "contact_nobody_on_this_invoice" },
+    ]);
+    findContactsByName.mockResolvedValue([
+      { id: "contact_ryan_user", name: "Ryan Smith" },
+      { id: "contact_ryan_client", name: "Ryan Smith" },
+    ]);
+    const message = makeMessage();
+
+    await processMessage(message);
+
+    const invoice = getInvoiceByMessage(message.id)!;
+    expect(invoice.stage).toBe("exception");
+    expect(invoice.exceptionReason).toBe("supplierNotFound");
+    expect(invoice.primeContactId).toBeNull();
+  });
+
   it("unresolved supplier -> Exceptions/Supplier not found", async () => {
     findContactsByAbn.mockResolvedValue([]);
     findContactsByName.mockResolvedValue([]);

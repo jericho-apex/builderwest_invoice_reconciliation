@@ -77,16 +77,19 @@ inc GST (invoice 1 matches to the cent), PO21267 is $405.00 + $40.50 =
 **$445.50** against invoice 2's $775.50. The invented $605.00 placeholder is
 retired.
 
-**What blocks a live E2E run today.** Production Prime holds **four** contacts
-named `Ryan Smith` (one `User`, one `Client`, two `Customer`), so invoice 1's
-supplier cannot resolve under the exactly-one-match rule and it exits at
-`supplierNotFound` before cost is ever checked. `ASSUME_SUPPLIER_MATCHED=true`
-(see below) is the test-run device for getting past that; the real fix is the
-client deduping, or resolving the supplier from the work order's `assignedId`,
-which already points at the right contact on both dummy work orders. Note also
-that all three dummy "suppliers" are Builderwest staff (`contactType: User`,
-`@builderwest.com.au`), so this data does not exercise supplier matching the way
-production will.
+**The four-way "Ryan Smith".** Production Prime holds four contacts named
+`Ryan Smith` (one `User`, one `Client`, two `Customer`), so invoice 1's supplier
+cannot resolve by name alone. The **assignment tie-break** (see `matching/`
+below) settles it: PO21266 is assigned to `8141089f…`, which is one of the four,
+so the supplier resolves as `matched_by_assignment` — verified live. Deduping the
+contacts in Prime is still worth asking for, and `ASSUME_SUPPLIER_MATCHED`
+remains as a separate escape hatch, but neither is needed for these three
+invoices any more.
+
+Note the dummy "suppliers" are all Builderwest staff (`contactType: User`,
+`@builderwest.com.au`) and every invoice prints the placeholder ABN, so this data
+still does not exercise supplier matching the way production will — ABN matching
+in particular is untested.
 
 ## Critical operational context
 
@@ -241,9 +244,15 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   names, so trusting it would resolve both to the same contact. **Across both,
   the rule is exactly-one-match: zero matches and several matches are equally
   unresolved, never `data[0]`** — which is why the Prime finders return arrays.
-  The single exception is `ASSUME_SUPPLIER_MATCHED`, which converts an unresolved
-  supplier into `"assumed"` for a test run; it never changes which lookups run,
-  and never overrides a genuine match.
+  The one narrowing allowed is the **assignment tie-break**: where several
+  contacts share the invoice's supplier name and exactly one of them is the
+  contact the matched work order is assigned to (`assignedId`), that one wins,
+  recorded as `matched_by_assignment`. It is not `data[0]` in disguise — the
+  candidate set is already restricted to contacts the invoice itself names, so it
+  can never introduce an unrelated party, and it never fires when the name
+  matched nobody. This is what makes Builderwest's four-way "Ryan Smith"
+  ambiguity resolvable. `ASSUME_SUPPLIER_MATCHED` is the separate test-run
+  bypass; neither changes which lookups run, nor overrides a genuine match.
   `compareCost` (integer-cents
   comparison against `COST_FIELD`/`COST_TOLERANCE_MODE`/`COST_TOLERANCE_VALUE`
   from env — a tighter tolerance only ever sends more items to review, never

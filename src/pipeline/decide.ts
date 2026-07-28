@@ -37,7 +37,7 @@ export type MatchDecision =
       workOrder: PrimeWorkOrder;
       /** Absent only when supplierMatchStatus is "assumed" — there is no verified contact to report. */
       contact?: PrimeContact;
-      supplierMatchStatus: "matched_by_abn" | "matched_by_name" | "assumed";
+      supplierMatchStatus: "matched_by_abn" | "matched_by_name" | "matched_by_assignment" | "assumed";
       cost: CostComparisonResult;
       matchResult: MatchResultPayload;
       auditEvents: DecisionAuditEvent[];
@@ -111,7 +111,13 @@ export async function decideMatch(
   const workOrder = workOrderResolution.workOrder;
 
   const supplierResolution = await resolveSupplier(
-    { abn: fields.supplierAbn, name: fields.supplierName },
+    {
+      abn: fields.supplierAbn,
+      name: fields.supplierName,
+      // Tie-breaker only, and only among contacts already matching the name —
+      // see resolveSupplier for why that constraint is what makes it safe.
+      workOrderAssignedId: workOrder.assignedId,
+    },
     context,
   );
   if (supplierResolution.status === "not_found") {

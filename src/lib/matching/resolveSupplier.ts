@@ -8,6 +8,12 @@ export type SupplierResolution =
   | { status: "matched_by_abn"; contact: PrimeContact }
   | { status: "matched_by_name"; contact: PrimeContact }
   /**
+   * Several contacts carry the invoice's supplier name, and exactly one of them
+   * is the contact the matched work order is assigned to. Distinct from
+   * matched_by_name so a reader can tell that a tie was broken and on what.
+   */
+  | { status: "matched_by_assignment"; contact: PrimeContact }
+  /**
    * ASSUME_SUPPLIER_MATCHED only. The supplier did NOT resolve — this says
    * "proceed as though it had", and carries no contact because there is no
    * verified one to carry. `candidateCount` is how many contacts the name
@@ -19,6 +25,12 @@ export type SupplierResolution =
 export interface SupplierResolutionInput {
   abn: string | null;
   name: string | null;
+  /**
+   * The contact the matched work order is assigned to, used only as a
+   * tie-breaker — see resolveSupplier. Absent when no work order resolved, in
+   * which case supplier resolution never runs anyway.
+   */
+  workOrderAssignedId?: string;
 }
 
 /** Exactly one match resolves; zero or several do not (see resolveWorkOrder for the reasoning). */
@@ -34,6 +46,17 @@ function soleMatch(contacts: PrimeContact[]): PrimeContact | undefined {
  * suppliers, so matching on it would resolve them all to the same contact.
  * An unusable ABN just means falling through to the name lookup; it is never
  * an exception in itself.
+ *
+ * THE ASSIGNMENT TIE-BREAK. Builderwest's production Prime holds four contacts
+ * named "Ryan Smith", so the name lookup alone cannot resolve their own
+ * auto-approve invoice. Where several contacts share the name and exactly one of
+ * them is the contact the matched work order is ASSIGNED to, that one is taken.
+ *
+ * What makes this safe rather than a dressed-up `data[0]`: the candidate set is
+ * already restricted to contacts whose name matches the invoice, so the
+ * tie-break can only ever choose among suppliers the invoice itself names. It
+ * cannot introduce an unrelated party, and it cannot fire when the name matched
+ * nobody — no name match means no corroboration, which is still not_found.
  *
  * Both lookups still run in full under ASSUME_SUPPLIER_MATCHED — the flag only
  * changes what an unresolved result means, never whether Prime is asked. A
@@ -59,6 +82,17 @@ export async function resolveSupplier(
     const byName = soleMatch(byNameCandidates);
     if (byName) {
       return { status: "matched_by_name", contact: byName };
+    }
+
+    // Only ever narrows an existing set of name matches — never a lookup of its
+    // own, and never reached when the name matched nobody.
+    if (input.workOrderAssignedId) {
+      const assigned = soleMatch(
+        byNameCandidates.filter((contact) => contact.id === input.workOrderAssignedId),
+      );
+      if (assigned) {
+        return { status: "matched_by_assignment", contact: assigned };
+      }
     }
   }
 
