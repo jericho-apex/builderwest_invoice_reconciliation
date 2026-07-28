@@ -1,4 +1,3 @@
-import { loadEnv } from "../config/env.js";
 import { EXTRACTION_CONFIDENCE_THRESHOLD } from "../config/constants.js";
 import {
   getInvoiceById,
@@ -10,21 +9,20 @@ import {
 import { recordMatchResult } from "../db/repositories/matchResults.js";
 import { appendAuditLog } from "../db/repositories/auditLog.js";
 import { logger } from "../log/logger.js";
+import { dollarsToCents } from "../lib/money.js";
 import { getPdfAttachments } from "../lib/graph/mailbox.js";
 import type { GraphMessageSummary } from "../lib/graph/mailbox.js";
 import { classifyMessage } from "../lib/extraction/classifyMessage.js";
 import { extractInvoiceFields } from "../lib/extraction/extractInvoice.js";
 import type { InvoiceExtraction } from "../lib/extraction/schemas.js";
-import { resolveWorkOrder } from "../lib/matching/resolveWorkOrder.js";
-import { resolveSupplier } from "../lib/matching/resolveSupplier.js";
-import { compareCost } from "../lib/matching/compareCost.js";
+import { decideMatch } from "./decide.js";
 import { passesStructuralPreFilter } from "./filter.js";
 import { routeToException } from "./exception.js";
 import { advanceApproveFlow } from "./approve.js";
 import { markProcessed } from "../db/repositories/processedMessages.js";
 
 function toCents(dollars: number | null): number | undefined {
-  return dollars === null ? undefined : Math.round(dollars * 100);
+  return dollars === null ? undefined : dollarsToCents(dollars);
 }
 
 function mapExtractionToFields(extraction: InvoiceExtraction): ExtractedFields {
@@ -37,6 +35,8 @@ function mapExtractionToFields(extraction: InvoiceExtraction): ExtractedFields {
     exTaxAmountCents: toCents(extraction.exTaxAmount),
     taxAmountCents: toCents(extraction.taxAmount),
     totalAmountCents: toCents(extraction.totalAmount),
+    purchaseOrderNumber: extraction.purchaseOrderNumber ?? undefined,
+    jobNumber: extraction.jobNumber ?? undefined,
     workOrderRef: extraction.workOrderRef ?? undefined,
     confidence: extraction.confidence,
   };
@@ -137,85 +137,49 @@ export async function driveInvoice(invoiceId: number): Promise<void> {
       }
 
       setExtraction(invoiceId, mapExtractionToFields(extraction));
+
+      // The identifiers, recorded explicitly rather than left implicit in the
+      // extraction blob: the PO is the sole matching key, and the job number
+      // is the evidence we need to answer how a `jobId` is obtained for
+      // attachment upload / AP-invoice create (prime-api-gaps.md Q3).
+      appendAuditLog({
+        ...context,
+        eventType: "pipeline.invoice_identifiers",
+        detail: {
+          purchaseOrderNumber: extraction.purchaseOrderNumber,
+          jobNumber: extraction.jobNumber,
+          workOrderRef: extraction.workOrderRef,
+        },
+      });
     }
 
     const afterExtraction = getInvoiceById(invoiceId)!;
 
     if (afterExtraction.stage === "extracted") {
-      const workOrderResolution = await resolveWorkOrder(afterExtraction.extractedWorkOrderRef, context);
-      if (workOrderResolution.status === "not_found") {
-        recordMatchResult({
-          invoiceId,
-          workOrderMatchStatus: "not_found",
-          supplierMatchStatus: "not_found",
-          decision: "exception",
-          exceptionReason: "noWorkOrder",
-        });
-        await routeToException(invoiceId, invoice.messageId, "noWorkOrder", context);
-        return;
-      }
-
-      const supplierResolution = await resolveSupplier(
-        { abn: afterExtraction.extractedSupplierAbn, name: afterExtraction.extractedSupplierName },
+      // decide.ts computes; this function owns every persisted consequence.
+      const decision = await decideMatch(
+        {
+          purchaseOrderNumber: afterExtraction.extractedPurchaseOrderNumber,
+          supplierAbn: afterExtraction.extractedSupplierAbn,
+          supplierName: afterExtraction.extractedSupplierName,
+          totalAmountCents: afterExtraction.extractedTotalAmountCents ?? 0,
+        },
         context,
       );
-      if (supplierResolution.status === "not_found") {
-        recordMatchResult({
-          invoiceId,
-          workOrderMatchStatus: "matched",
-          workOrderId: workOrderResolution.workOrder.id,
-          supplierMatchStatus: "not_found",
-          decision: "exception",
-          exceptionReason: "supplierNotFound",
-        });
-        await routeToException(invoiceId, invoice.messageId, "supplierNotFound", context);
+
+      recordMatchResult({ invoiceId, ...decision.matchResult });
+      for (const event of decision.auditEvents) {
+        appendAuditLog({ ...context, ...event });
+      }
+
+      if (decision.outcome === "exception") {
+        await routeToException(invoiceId, invoice.messageId, decision.reason, context);
         return;
       }
 
-      const env = loadEnv();
-      const costResult = compareCost(
-        afterExtraction.extractedTotalAmountCents ?? 0,
-        workOrderResolution.workOrder,
-        env.COST_FIELD,
-        env.COST_TOLERANCE_MODE,
-        env.COST_TOLERANCE_VALUE,
-      );
-
-      if (!costResult.withinTolerance) {
-        recordMatchResult({
-          invoiceId,
-          workOrderMatchStatus: "matched",
-          workOrderId: workOrderResolution.workOrder.id,
-          supplierMatchStatus: supplierResolution.status,
-          supplierContactId: supplierResolution.contact.id,
-          costFieldUsed: costResult.costField,
-          invoiceTotalCents: costResult.invoiceTotalCents,
-          workOrderCostCents: costResult.workOrderCostCents,
-          costDifferenceCents: costResult.differenceCents,
-          withinTolerance: false,
-          decision: "exception",
-          exceptionReason: "costMismatch",
-        });
-        await routeToException(invoiceId, invoice.messageId, "costMismatch", context);
-        return;
-      }
-
-      recordMatchResult({
-        invoiceId,
-        workOrderMatchStatus: "matched",
-        workOrderId: workOrderResolution.workOrder.id,
-        supplierMatchStatus: supplierResolution.status,
-        supplierContactId: supplierResolution.contact.id,
-        costFieldUsed: costResult.costField,
-        invoiceTotalCents: costResult.invoiceTotalCents,
-        workOrderCostCents: costResult.workOrderCostCents,
-        costDifferenceCents: costResult.differenceCents,
-        withinTolerance: true,
-        decision: "approve",
-      });
       setResolvedMatch(invoiceId, {
-        primeWorkOrderId: workOrderResolution.workOrder.id,
-        primeContactId: supplierResolution.contact.id,
+        primeWorkOrderId: decision.workOrder.id,
+        primeContactId: decision.contact.id,
       });
     }
 

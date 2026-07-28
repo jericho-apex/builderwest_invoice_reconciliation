@@ -18,6 +18,17 @@ export const InvoiceExtractionSchema = z.object({
   exTaxAmount: z.number().nullable(),
   taxAmount: z.number().nullable(),
   totalAmount: z.number().nullable(),
+  // The purchase order number is the ONLY identifier work-order matching keys
+  // off (see matching/resolveWorkOrder.ts) — the client's invoices print a PO
+  // per work order, whereas the job number is shared across every work order
+  // on the same job and so cannot identify one.
+  purchaseOrderNumber: z.string().nullable(),
+  // Extracted and persisted but deliberately NOT used for matching: it's the
+  // most likely route to the `jobId` that attachment upload and AP-invoice
+  // create both require (prime-api-gaps.md Q3).
+  jobNumber: z.string().nullable(),
+  // Kept for invoices that print an explicit work-order reference. Audit data
+  // only — it does not drive resolution.
   workOrderRef: z.string().nullable(),
   confidence: z.number().min(0).max(1),
 });

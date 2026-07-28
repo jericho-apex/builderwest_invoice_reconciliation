@@ -1,5 +1,6 @@
 import { primeRequest } from "./httpClient.js";
 import { buildEqQuery } from "./query.js";
+import { loadEnv } from "../../config/env.js";
 import { appendAuditLog, type AuditLogInput } from "../../db/repositories/auditLog.js";
 
 export type AuditContext = Pick<AuditLogInput, "invoiceId" | "messageId">;
@@ -46,19 +47,24 @@ function mapWorkOrder(row: PrimeWorkOrderApiRow): PrimeWorkOrder {
 }
 
 /**
- * NEEDS VENDOR CONFIRMATION: which work-order field the invoice's human-facing
- * reference / job number maps to. Prime's docs list `estimateId`,
- * `estimateItemId`, `estimateLabel`, `costTaxTotal` as queryable — but do NOT
- * document a `reference` or `jobNumber` field, so the field names below are
- * unconfirmed (see prime-api-gaps.md, open question Q1). The `q=` filter
+ * Returns EVERY matching work order, not just the first. Callers decide what
+ * to do with a multi-match — silently taking `data[0]` is how an invoice ends
+ * up approved against the wrong work order, which on this money path is worse
+ * than not matching at all (see matching/resolveWorkOrder.ts).
+ *
+ * NEEDS VENDOR CONFIRMATION: which work-order field holds the purchase order
+ * number. Prime's docs list `estimateId`, `estimateItemId`, `estimateLabel`,
+ * `costTaxTotal` as queryable — but do NOT document a purchase-order field
+ * (see prime-api-gaps.md, open question Q1), which is why the field name comes
+ * from `PRIME_WORK_ORDER_PO_FIELD` rather than being hardcoded. The `q=` filter
  * SYNTAX itself is correct. A wrong field name fails safe (no match -> routes
  * to Exceptions/No work order) but will misroute everything until confirmed.
  */
-async function findWorkOrderByField(
+async function findWorkOrdersByField(
   field: string,
   value: string,
   context: AuditContext,
-): Promise<PrimeWorkOrder | undefined> {
+): Promise<PrimeWorkOrder[]> {
   const q = buildEqQuery(field, value);
   const response = await primeRequest<PrimeListResponse<PrimeWorkOrderApiRow>>({
     method: "GET",
@@ -72,19 +78,21 @@ async function findWorkOrderByField(
     detail: { q, matchCount: response.data.length },
   });
 
-  return response.data[0] ? mapWorkOrder(response.data[0]) : undefined;
+  return response.data.map(mapWorkOrder);
 }
 
-export function findWorkOrderByReference(
-  reference: string,
+/**
+ * The one work-order lookup the matching engine performs. The purchase order
+ * number is the only identifier on a supplier invoice that names a single work
+ * order — a job number is shared by every work order on that job.
+ */
+export function findWorkOrdersByPurchaseOrder(
+  purchaseOrderNumber: string,
   context: AuditContext,
-): Promise<PrimeWorkOrder | undefined> {
-  return findWorkOrderByField("reference", reference, context);
-}
-
-export function findWorkOrderByJobNumber(
-  jobNumber: string,
-  context: AuditContext,
-): Promise<PrimeWorkOrder | undefined> {
-  return findWorkOrderByField("jobNumber", jobNumber, context);
+): Promise<PrimeWorkOrder[]> {
+  return findWorkOrdersByField(
+    loadEnv().PRIME_WORK_ORDER_PO_FIELD,
+    purchaseOrderNumber,
+    context,
+  );
 }

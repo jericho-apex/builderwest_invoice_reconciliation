@@ -1,57 +1,72 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const findWorkOrderByReference = vi.fn();
-const findWorkOrderByJobNumber = vi.fn();
+const findWorkOrdersByPurchaseOrder = vi.fn();
 
 vi.mock("../../../src/lib/prime/workOrders.js", () => ({
-  findWorkOrderByReference: (...args: unknown[]) => findWorkOrderByReference(...args),
-  findWorkOrderByJobNumber: (...args: unknown[]) => findWorkOrderByJobNumber(...args),
+  findWorkOrdersByPurchaseOrder: (...args: unknown[]) => findWorkOrdersByPurchaseOrder(...args),
 }));
 
 const { resolveWorkOrder } = await import("../../../src/lib/matching/resolveWorkOrder.js");
 
 const context = { messageId: "msg-1" };
-const workOrder = { id: "wo_1", costCents: 1000, costTaxTotalCents: 1100 };
+const stage1 = { id: "wo_stage_1", costCents: 43_500, costTaxTotalCents: 47_850 };
+const stage2 = { id: "wo_stage_2", costCents: 70_500, costTaxTotalCents: 77_550 };
 
 describe("resolveWorkOrder", () => {
   beforeEach(() => {
-    findWorkOrderByReference.mockReset();
-    findWorkOrderByJobNumber.mockReset();
+    findWorkOrdersByPurchaseOrder.mockReset();
   });
 
-  it("returns not_found without calling Prime when the reference is null — never a guess", async () => {
+  it("returns not_found without calling Prime when no PO was extracted — never a guess", async () => {
     const result = await resolveWorkOrder(null, context);
-    expect(result).toEqual({ status: "not_found" });
-    expect(findWorkOrderByReference).not.toHaveBeenCalled();
-    expect(findWorkOrderByJobNumber).not.toHaveBeenCalled();
-  });
-
-  it("matches by reference and does not fall back to job number when the reference hits", async () => {
-    findWorkOrderByReference.mockResolvedValue(workOrder);
-
-    const result = await resolveWorkOrder("WO-42", context);
-
-    expect(result).toEqual({ status: "matched", workOrder });
-    expect(findWorkOrderByJobNumber).not.toHaveBeenCalled();
-  });
-
-  it("falls back to job number when the reference lookup misses", async () => {
-    findWorkOrderByReference.mockResolvedValue(undefined);
-    findWorkOrderByJobNumber.mockResolvedValue(workOrder);
-
-    const result = await resolveWorkOrder("JOB-99", context);
-
-    expect(result).toEqual({ status: "matched", workOrder });
-    expect(findWorkOrderByReference).toHaveBeenCalledWith("JOB-99", context);
-    expect(findWorkOrderByJobNumber).toHaveBeenCalledWith("JOB-99", context);
-  });
-
-  it("returns not_found when both reference and job number lookups miss", async () => {
-    findWorkOrderByReference.mockResolvedValue(undefined);
-    findWorkOrderByJobNumber.mockResolvedValue(undefined);
-
-    const result = await resolveWorkOrder("UNKNOWN-1", context);
 
     expect(result).toEqual({ status: "not_found" });
+    expect(findWorkOrdersByPurchaseOrder).not.toHaveBeenCalled();
+  });
+
+  it("treats an empty PO the same as a missing one", async () => {
+    const result = await resolveWorkOrder("", context);
+
+    expect(result).toEqual({ status: "not_found" });
+    expect(findWorkOrdersByPurchaseOrder).not.toHaveBeenCalled();
+  });
+
+  it("matches when the PO resolves to exactly one work order", async () => {
+    findWorkOrdersByPurchaseOrder.mockResolvedValue([stage1]);
+
+    const result = await resolveWorkOrder("PO21266", context);
+
+    expect(result).toEqual({ status: "matched", workOrder: stage1 });
+    expect(findWorkOrdersByPurchaseOrder).toHaveBeenCalledWith("PO21266", context);
+  });
+
+  it("returns not_found when the PO matches nothing", async () => {
+    findWorkOrdersByPurchaseOrder.mockResolvedValue([]);
+
+    const result = await resolveWorkOrder("PO-UNKNOWN", context);
+
+    expect(result).toEqual({ status: "not_found" });
+  });
+
+  // The defect this rewrite exists to close: the previous implementation took
+  // the first row of a multi-match, which on the client's data (job BWC-5126
+  // carries both a Stage 1 and a Stage 2 work order) could approve an invoice
+  // against a sibling work order.
+  it("returns ambiguous — never the first row — when several work orders match", async () => {
+    findWorkOrdersByPurchaseOrder.mockResolvedValue([stage1, stage2]);
+
+    const result = await resolveWorkOrder("PO21266", context);
+
+    expect(result).toEqual({ status: "ambiguous", matchCount: 2 });
+    expect(result).not.toMatchObject({ status: "matched" });
+  });
+
+  it("does not fall back to any other identifier when the PO misses", async () => {
+    findWorkOrdersByPurchaseOrder.mockResolvedValue([]);
+
+    await resolveWorkOrder("PO21266", context);
+
+    // Exactly one lookup: no reference retry, no job-number retry.
+    expect(findWorkOrdersByPurchaseOrder).toHaveBeenCalledOnce();
   });
 });

@@ -12,6 +12,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/worker/index.js",
     "db:migrate": "tsx src/db/migrate.ts",
+    "extract:sample": "tsx --env-file-if-exists=.env.local scripts/extract-sample.ts",
+    "pipeline:sample": "tsx --env-file-if-exists=.env.local scripts/pipeline-sample.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",

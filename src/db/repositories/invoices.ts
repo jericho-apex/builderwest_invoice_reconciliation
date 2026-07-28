@@ -35,6 +35,10 @@ export interface ExtractedFields {
   exTaxAmountCents?: number;
   taxAmountCents?: number;
   totalAmountCents?: number;
+  /** The only identifier work-order matching keys off — see matching/resolveWorkOrder.ts. */
+  purchaseOrderNumber?: string;
+  /** Captured for context and for the open `jobId` question; never used to match. */
+  jobNumber?: string;
   workOrderRef?: string;
   confidence: number;
 }
@@ -52,6 +56,8 @@ export interface InvoiceRecord {
   extractedExTaxAmountCents: number | null;
   extractedTaxAmountCents: number | null;
   extractedTotalAmountCents: number | null;
+  extractedPurchaseOrderNumber: string | null;
+  extractedJobNumber: string | null;
   extractedWorkOrderRef: string | null;
   extractionConfidence: number | null;
   primeWorkOrderId: string | null;
@@ -81,6 +87,8 @@ interface InvoiceRow {
   extracted_ex_tax_amount_cents: number | null;
   extracted_tax_amount_cents: number | null;
   extracted_total_amount_cents: number | null;
+  extracted_purchase_order_number: string | null;
+  extracted_job_number: string | null;
   extracted_work_order_ref: string | null;
   extraction_confidence: number | null;
   prime_work_order_id: string | null;
@@ -111,6 +119,8 @@ function mapRow(row: InvoiceRow): InvoiceRecord {
     extractedExTaxAmountCents: row.extracted_ex_tax_amount_cents,
     extractedTaxAmountCents: row.extracted_tax_amount_cents,
     extractedTotalAmountCents: row.extracted_total_amount_cents,
+    extractedPurchaseOrderNumber: row.extracted_purchase_order_number,
+    extractedJobNumber: row.extracted_job_number,
     extractedWorkOrderRef: row.extracted_work_order_ref,
     extractionConfidence: row.extraction_confidence,
     primeWorkOrderId: row.prime_work_order_id,
@@ -210,6 +220,8 @@ export function setExtraction(id: number, fields: ExtractedFields): void {
          extracted_ex_tax_amount_cents = @exTaxAmountCents,
          extracted_tax_amount_cents = @taxAmountCents,
          extracted_total_amount_cents = @totalAmountCents,
+         extracted_purchase_order_number = @purchaseOrderNumber,
+         extracted_job_number = @jobNumber,
          extracted_work_order_ref = @workOrderRef,
          extraction_confidence = @confidence
        WHERE id = @id`,
@@ -224,6 +236,8 @@ export function setExtraction(id: number, fields: ExtractedFields): void {
       exTaxAmountCents: fields.exTaxAmountCents ?? null,
       taxAmountCents: fields.taxAmountCents ?? null,
       totalAmountCents: fields.totalAmountCents ?? null,
+      purchaseOrderNumber: fields.purchaseOrderNumber ?? null,
+      jobNumber: fields.jobNumber ?? null,
       workOrderRef: fields.workOrderRef ?? null,
       confidence: fields.confidence,
     });

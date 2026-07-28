@@ -23,6 +23,7 @@ npm run dev                 # tsx watch src/worker/index.ts — hot reload
 npm run build                # tsc -p tsconfig.json -> dist/
 npm start                    # node dist/worker/index.js (what Render runs)
 npm test                     # vitest run
+npm run pipeline:sample      # the three client PDFs -> decision, vs a fake Prime
 npm run test:watch
 npm run lint                  # eslint .
 npm run format                # prettier --write .
@@ -30,6 +31,49 @@ npm run format                # prettier --write .
 
 Run a single test file: `npx vitest run tests/lib/matching/compareCost.test.ts`
 Run tests matching a name: `npx vitest run -t "some test name"`
+
+Two manual sample runners, both deliberately outside `npm test`, both loading
+`.env.local` if present:
+
+- `npm run extract:sample` runs the real extraction prompt against the dummy
+  invoice PDFs in `docs/` and prints the JSON — the way to check a prompt change
+  against the client's actual invoice layout and to calibrate
+  `EXTRACTION_CONFIDENCE_THRESHOLD`. Calls OpenRouter only.
+- `npm run pipeline:sample` carries on from there into the decision: same PDFs,
+  real extraction, then the same `decideMatch` the worker runs, against a fake
+  Prime on loopback (`scripts/lib/fake-prime-server.ts`). Prints per invoice what
+  the model read, which work order and contact resolved, and which folder it
+  would land in, exiting non-zero on any deviation from
+  `tests/fixtures/clientDummyInvoices.ts`. **No Graph call at all** — it stops at
+  the decision. `-- --offline` skips the model and uses fixture extraction, which
+  still exercises the real Prime client stack but proves nothing about how the
+  PDFs are read.
+
+Both source their PDF list from `tests/fixtures/clientDummyInvoices.ts`, which is
+also what the "three client dummy invoices" test block asserts against — add a
+new client sample there and everything picks it up.
+
+### What the three client dummy invoices prove
+
+| PDF | Issuer | PO | Total inc | Expected |
+|---|---|---|---|---|
+| `Dummy_Invoice_1_PO21266_CORRECT` | Ryan Smith | PO21266 | $478.50 | approve → `Processed` |
+| `Dummy_Invoice_2_PO21267_INCORRECT_AMOUNT` | Tobey Chan | PO21267 | $775.50 | `Exceptions/Cost mismatch` |
+| `Dummy_Invoice_3_INCORRECT_PO` | Brittnii Woods | PO99999 | $852.50 | `Exceptions/No work order` |
+
+Two traps worth knowing before changing extraction or matching:
+
+- **The Attention line.** Invoices 2 and 3 print `Attention: Ryan Smith` while
+  their real issuers are Tobey Chan and Brittnii Woods. Invoice 2 produces
+  `costMismatch` either way, so an outcome-only assertion passes while the
+  supplier is wrong — which is why the fixtures pin the resolved contact id.
+- **The placeholder ABN.** All three print `00 000 000 000`, so all three must
+  resolve by name. Any `'abn'.eq(...)` query reaching Prime is a failure, and
+  both the test block and `pipeline:sample` assert none is sent.
+
+PO21267's true `costTaxTotal` in Prime is **unknown** — the fixture uses a
+flagged placeholder ($605.00). The routing proof holds for any value ≠ $775.50,
+but confirm the real figure with the client.
 
 ## Critical operational context
 
@@ -100,8 +144,18 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   before any AI call. Deliberately has no sender-allowlist/subject-pattern
   filter yet (needs real patterns from Builderwest first).
 - `orchestrator.ts` — `processMessage` (classify → create one `invoices` row
-  per PDF attachment → drive) and `driveInvoice` (extract → resolve work order →
-  resolve supplier → compare cost → approve flow).
+  per PDF attachment → drive) and `driveInvoice` (extract → `decideMatch` →
+  persist the outcome → approve flow or exception routing).
+- `decide.ts` — `decideMatch`, the matching decision core: work order →
+  supplier → cost, stopping at the first failing check. It computes and
+  `driveInvoice` persists — no `match_results` row, no `invoices` update, and
+  crucially **no Graph call**, which is what makes it the largest slice of
+  pipeline runnable outside the worker (`GRAPH_BASE_URL` is a hardcoded const,
+  so anything that moves a message can only hit the live mailbox). Audit rows
+  come back as data rather than being written, because
+  `pipeline.work_order_unresolved` carries a `matchCount` the caller can't
+  reconstruct. Not side-effect free though: the Prime finders write their own
+  `audit_log` rows, so a migrated DB is still required.
 - `approve.ts` — `advanceApproveFlow`, a stage-by-stage loop: upload attachment
   → create AP invoice → approve → poll `isSynced`. The sync poll checks once per
   call and returns `"pending_sync"` rather than looping with a sleep — polling
@@ -133,9 +187,18 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   JSON-only system prompt, `parseModelJson` validates against a Zod schema
   (`schemas.ts`). Low-confidence or unparseable extraction routes to
   `Exceptions/Unreadable` rather than being trusted.
-- `matching/` — pure functions layered over the Prime clients:
-  `resolveWorkOrder` (by reference, falls back to job number),
-  `resolveSupplier` (by ABN, falls back to name), `compareCost` (integer-cents
+- `matching/` — pure functions layered over the Prime clients.
+  `resolveWorkOrder` keys **only** off the invoice's purchase order number and
+  has deliberately no job-number fallback: a job carries many work orders (the
+  client's two dummy invoices are Stage 1 and Stage 2 of job `BWC-5126`,
+  differing only by PO), so falling back to it would let an invoice be approved
+  against a sibling work order. `resolveSupplier` tries ABN then name, but only
+  uses an ABN that passes `matching/abn.ts`'s checksum validation — the dummy
+  invoices print the placeholder `00 000 000 000` under two different supplier
+  names, so trusting it would resolve both to the same contact. **Across both,
+  the rule is exactly-one-match: zero matches and several matches are equally
+  unresolved, never `data[0]`** — which is why the Prime finders return arrays.
+  `compareCost` (integer-cents
   comparison against `COST_FIELD`/`COST_TOLERANCE_MODE`/`COST_TOLERANCE_VALUE`
   from env — a tighter tolerance only ever sends more items to review, never
   widens what counts as a match).
@@ -161,7 +224,15 @@ produces false mismatches.
 Vitest, `tests/` mirrors `src/` structure, config in `vitest.config.ts`
 (`environment: "node"`). Current coverage is the matching engine and DB
 repositories — dry-run pipeline tests exercise the full flow without ever
-calling a Prime write endpoint. Live write-path tests against
+calling a Prime write endpoint. Shared fixtures live in `tests/fixtures/`; the
+sample scripts import from there too, so the offline suite and the live proof
+run can't drift.
+
+The suite is hermetic and offline: extraction is mocked, and the Prime finders
+are `vi.mock`ed. That last part means `buildEqQuery`, `primeRequest`, the
+JSON:API `Accept` header and `mapWorkOrder`'s dollars→cents conversion are
+covered by **no test** — `npm run pipeline:sample` is the only thing that
+exercises them, which is part of why it exists. Live write-path tests against
 `PRIME_TEST_WORK_ORDER_ID` are run separately and manually, requiring the
 sign-off/cleanup steps in the implementation plan — do not wire these into the
 automated suite.

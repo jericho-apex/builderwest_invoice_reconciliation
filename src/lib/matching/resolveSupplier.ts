@@ -1,6 +1,7 @@
-import { findContactByAbn, findContactByName } from "../prime/contacts.js";
+import { findContactsByAbn, findContactsByName } from "../prime/contacts.js";
 import type { PrimeContact } from "../prime/contacts.js";
 import type { AuditContext } from "../prime/workOrders.js";
+import { normalizeAbn, isValidAbn } from "./abn.js";
 
 export type SupplierResolution =
   | { status: "matched_by_abn"; contact: PrimeContact }
@@ -12,20 +13,35 @@ export interface SupplierResolutionInput {
   name: string | null;
 }
 
-/** Resolves the supplier by ABN first, name as fallback (PRD §4.1 step 4b). */
+/** Exactly one match resolves; zero or several do not (see resolveWorkOrder for the reasoning). */
+function soleMatch(contacts: PrimeContact[]): PrimeContact | undefined {
+  return contacts.length === 1 ? contacts[0] : undefined;
+}
+
+/**
+ * Resolves the supplier by ABN first, name as fallback (PRD §4.1 step 4b).
+ *
+ * The ABN is only used as a key once it validates as a real ABN — a
+ * placeholder like "00 000 000 000" appears on invoices from different
+ * suppliers, so matching on it would resolve them all to the same contact.
+ * An unusable ABN just means falling through to the name lookup; it is never
+ * an exception in itself.
+ */
 export async function resolveSupplier(
   input: SupplierResolutionInput,
   context: AuditContext,
 ): Promise<SupplierResolution> {
-  if (input.abn) {
-    const byAbn = await findContactByAbn(input.abn, context);
+  const abn = input.abn ? normalizeAbn(input.abn) : "";
+
+  if (isValidAbn(abn)) {
+    const byAbn = soleMatch(await findContactsByAbn(abn, context));
     if (byAbn) {
       return { status: "matched_by_abn", contact: byAbn };
     }
   }
 
   if (input.name) {
-    const byName = await findContactByName(input.name, context);
+    const byName = soleMatch(await findContactsByName(input.name, context));
     if (byName) {
       return { status: "matched_by_name", contact: byName };
     }

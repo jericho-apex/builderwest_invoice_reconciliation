@@ -14,6 +14,14 @@ const envSchema = z.object({
   PRIME_DRY_RUN: boolFromString.default("true"),
   PRIME_TEST_WORK_ORDER_ID: z.string().optional(),
 
+  // Which queryable work-order field holds the purchase order number printed
+  // on a supplier invoice. UNCONFIRMED — Prime's v2 docs do not list a PO
+  // field (prime-api-gaps.md Q1), and this is now the ONLY key work-order
+  // matching uses, so a wrong name means nothing ever matches. Kept as config
+  // (like COST_FIELD) so the vendor's answer needs no code change. Fails safe:
+  // a bad field name yields zero matches -> Exceptions/No work order.
+  PRIME_WORK_ORDER_PO_FIELD: z.string().min(1).default("purchaseOrderNumber"),
+
   COST_TOLERANCE_MODE: z.enum(["exact", "dollar", "percentage"]).default("exact"),
   COST_TOLERANCE_VALUE: z.coerce.number().default(0),
   COST_FIELD: z.enum(["cost", "costTaxTotal"]).default("costTaxTotal"),

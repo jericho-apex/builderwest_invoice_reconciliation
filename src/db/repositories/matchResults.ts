@@ -1,7 +1,20 @@
 import { getDb } from "../client.js";
 
-export type WorkOrderMatchStatus = "matched" | "not_found";
-export type SupplierMatchStatus = "matched_by_abn" | "matched_by_name" | "not_found";
+// "ambiguous" = the lookup returned more than one work order, so none of them
+// can be trusted as THE match. It routes to the same Exceptions/No work order
+// folder as "not_found" (accounts staff work one folder either way), but is
+// recorded distinctly so the two are tellable apart afterwards.
+export type WorkOrderMatchStatus = "matched" | "not_found" | "ambiguous";
+// "not_attempted" = work-order resolution failed first, so supplier resolution never ran.
+// Distinct from "not_found", which means we asked Prime and it had nobody. Recording
+// "not_found" for a lookup that never happened is the kind of wrong signal this pilot
+// exists to avoid — a human triaging Exceptions/No work order would otherwise conclude
+// the supplier is missing from Prime on no evidence at all.
+export type SupplierMatchStatus =
+  | "matched_by_abn"
+  | "matched_by_name"
+  | "not_found"
+  | "not_attempted";
 export type Decision = "approve" | "exception";
 
 export interface MatchResultInput {
