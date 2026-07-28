@@ -61,6 +61,8 @@ export interface InvoiceRecord {
   extractedWorkOrderRef: string | null;
   extractionConfidence: number | null;
   primeWorkOrderId: string | null;
+  /** The job the work order belongs to — required by both Prime write steps. */
+  primeJobId: string | null;
   primeContactId: string | null;
   primeAttachmentId: string | null;
   primeApInvoiceId: string | null;
@@ -92,6 +94,7 @@ interface InvoiceRow {
   extracted_work_order_ref: string | null;
   extraction_confidence: number | null;
   prime_work_order_id: string | null;
+  prime_job_id: string | null;
   prime_contact_id: string | null;
   prime_attachment_id: string | null;
   prime_ap_invoice_id: string | null;
@@ -124,6 +127,7 @@ function mapRow(row: InvoiceRow): InvoiceRecord {
     extractedWorkOrderRef: row.extracted_work_order_ref,
     extractionConfidence: row.extraction_confidence,
     primeWorkOrderId: row.prime_work_order_id,
+    primeJobId: row.prime_job_id,
     primeContactId: row.prime_contact_id,
     primeAttachmentId: row.prime_attachment_id,
     primeApInvoiceId: row.prime_ap_invoice_id,
@@ -246,19 +250,21 @@ export function setExtraction(id: number, fields: ExtractedFields): void {
 
 export function setResolvedMatch(
   id: number,
-  match: { primeWorkOrderId?: string; primeContactId?: string },
+  match: { primeWorkOrderId?: string; primeJobId?: string; primeContactId?: string },
 ): void {
   getDb()
     .prepare(
       `UPDATE invoices SET
          stage = 'matched',
          prime_work_order_id = COALESCE(@primeWorkOrderId, prime_work_order_id),
+         prime_job_id = COALESCE(@primeJobId, prime_job_id),
          prime_contact_id = COALESCE(@primeContactId, prime_contact_id)
        WHERE id = @id`,
     )
     .run({
       id,
       primeWorkOrderId: match.primeWorkOrderId ?? null,
+      primeJobId: match.primeJobId ?? null,
       primeContactId: match.primeContactId ?? null,
     });
   touch(id);

@@ -30,6 +30,17 @@ const envSchema = z.object({
   // would not match a work order labelled "17651" under an exact-match query.
   PRIME_WORK_ORDER_PO_FIELD: z.string().min(1).default("label"),
 
+  // Which Prime attachment type an uploaded invoice PDF is filed under. Tenant
+  // data, not a business rule, hence env — the IDs differ per Prime tenant.
+  //
+  // FOR BUILDERWEST TO CONFIRM. Read from production 2026-07-28: the AP invoices
+  // that already exist carry attachments of type 2903b377-… , labelled
+  // "Invoices" — but that type is NOT returned by /attachment-types, so it looks
+  // retired. The default below is the active equivalent, "Subcontractor
+  // Invoices". Both work; the question is which one Builderwest wants automated
+  // uploads to appear under.
+  PRIME_ATTACHMENT_TYPE_ID: z.string().min(1).default("7f38c5c1-d5dd-4981-8868-e79f4f3323e8"),
+
   COST_TOLERANCE_MODE: z.enum(["exact", "dollar", "percentage"]).default("exact"),
   COST_TOLERANCE_VALUE: z.coerce.number().default(0),
 

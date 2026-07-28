@@ -7,11 +7,19 @@ import { DRY_RUN_ID_PREFIX } from "./attachments.js";
 import type { AuditContext } from "./workOrders.js";
 
 export interface CreateApInvoiceInput {
+  /** Required by Prime — the supplier's own invoice number, off the PDF. */
+  invoiceNumber: string;
+  /** Required by Prime. Comes from the matched work order, never from the PDF. */
+  jobId: string;
+  /** Optional to Prime, but the whole point of matching — always sent. */
   workOrderId: string;
   attachmentId: string;
-  exTaxAmountCents: number;
-  taxAmountCents: number;
+  /** Tax-INCLUSIVE total. See createApInvoice for why this and nothing else. */
   totalAmountCents: number;
+  /** ISO date (YYYY-MM-DD) — Prime's `invoicedDate`. */
+  invoicedDate: string;
+  /** ISO date (YYYY-MM-DD). */
+  dueDate: string;
 }
 
 export interface ApInvoiceSyncStatus {
@@ -20,8 +28,9 @@ export interface ApInvoiceSyncStatus {
   syncedFinanceSystemReference?: string;
 }
 
+// JSON:API — created id at data.id, as with attachments.
 interface PrimeApInvoiceApiResponse {
-  id: string;
+  data: { id: string };
 }
 
 interface PrimeApInvoiceSyncApiResponse {
@@ -39,10 +48,21 @@ function isDryRunId(id: string): boolean {
 }
 
 /**
- * Creates the accounts-payable invoice record referencing an already-
- * uploaded attachment (PRD §5.1 — approve-flow ordering requires the
- * attachment to exist first). Dry-run gated the same way as
- * attachments.uploadAttachment — see that file's docstring for why.
+ * Creates the accounts-payable invoice record referencing an already-uploaded
+ * attachment (PRD §5.1 — approve-flow ordering requires the attachment to exist
+ * first). Dry-run gated the same way as attachments.uploadAttachment.
+ *
+ * THE AMOUNT MODEL, verified against 15 production AP invoices on 2026-07-28:
+ * `amount` is the tax-INCLUSIVE total, `tax` is the RATE (0.1000, not a dollar
+ * figure), and `taxTotal` is the GST amount Prime calculates itself. Every
+ * record checked is exact — e.g. amount 968.0000 with taxTotal 88, i.e.
+ * 968 / 1.1 = 880 ex-GST. So create sends one `amount` and nothing else about
+ * tax; sending a `taxTotal` (as this did) both invented a value Prime derives
+ * and, worse, passed the ex-GST figure as `amount`, which would have created
+ * every AP invoice ~9% short.
+ *
+ * The same convention holds on work orders (`tax` a rate, `costTaxTotal` the GST
+ * amount), which is why cost matching compares inc-GST to inc-GST.
  */
 export async function createApInvoice(
   input: CreateApInvoiceInput,
@@ -50,13 +70,23 @@ export async function createApInvoice(
 ): Promise<string> {
   const env = loadEnv();
 
+  const body = {
+    invoiceNumber: input.invoiceNumber,
+    jobId: input.jobId,
+    workOrderId: input.workOrderId,
+    attachmentId: input.attachmentId,
+    amount: fromCents(input.totalAmountCents),
+    invoicedDate: input.invoicedDate,
+    dueDate: input.dueDate,
+  };
+
   if (env.PRIME_DRY_RUN) {
     const fakeId = `${DRY_RUN_ID_PREFIX}ap-invoice-${randomUUID()}`;
-    logger.info("[dry-run] would create AP invoice in Prime", { input, fakeId });
+    logger.info("[dry-run] would create AP invoice in Prime", { body, fakeId });
     appendAuditLog({
       ...context,
       eventType: "prime.create_ap_invoice.dry_run",
-      detail: { input, fakeId },
+      detail: { body, fakeId },
     });
     return fakeId;
   }
@@ -64,22 +94,16 @@ export async function createApInvoice(
   const response = await primeRequest<PrimeApInvoiceApiResponse>({
     method: "POST",
     path: "/accounts-payable-invoices",
-    body: {
-      workOrderId: input.workOrderId,
-      attachmentId: input.attachmentId,
-      amount: fromCents(input.exTaxAmountCents),
-      tax: fromCents(input.taxAmountCents),
-      taxTotal: fromCents(input.totalAmountCents),
-    },
+    body,
   });
 
   appendAuditLog({
     ...context,
     eventType: "prime.create_ap_invoice",
-    detail: { input, apInvoiceId: response.id },
+    detail: { body, apInvoiceId: response.data.id },
   });
 
-  return response.id;
+  return response.data.id;
 }
 
 /**

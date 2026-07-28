@@ -137,10 +137,13 @@ const CLEAN_EXTRACTION = {
   confidence: 0.95,
 };
 
+// jobId is not decoration: both Prime writes require it, so an invoice matched
+// to a work order without one cannot be filed and routes to Unreadable.
 const MATCHING_WORK_ORDER = {
   id: "wo_po21266",
   costTotalCents: 43_500,
   costTaxTotalCents: 4_350,
+  jobId: "job_bwc5126",
 };
 
 // Stage 2 of the same job — the work order an invoice must never be matched to
@@ -149,6 +152,7 @@ const SIBLING_WORK_ORDER = {
   id: "wo_po21267",
   costTotalCents: 40_500,
   costTaxTotalCents: 4_050,
+  jobId: "job_bwc5126",
 };
 
 const MATCHING_CONTACT = { id: "contact_ryan", name: "Ryan Smith" };
@@ -195,6 +199,16 @@ function latestMatchResult(invoiceId: number): MatchResultRow {
          FROM match_results WHERE invoice_id = ? ORDER BY id DESC LIMIT 1`,
     )
     .get(invoiceId)!;
+}
+
+/** Every audit event recorded against an invoice, oldest first. */
+function auditEventTypes(invoiceId: number): string[] {
+  return getDb()
+    .prepare<[number], { event_type: string }>(
+      "SELECT event_type FROM audit_log WHERE invoice_id = ? ORDER BY id",
+    )
+    .all(invoiceId)
+    .map((row) => row.event_type);
 }
 
 function makeMessageSummaryForReply() {
@@ -335,6 +349,59 @@ describe("dry-run pipeline (no Prime writes)", () => {
       expect.anything(),
     );
     expect(sendMissingDataReply).toHaveBeenCalledOnce();
+  });
+
+  // Prime requires invoiceNumber, jobId, amount, invoicedDate and dueDate on AP
+  // create. Extraction can legitimately return null for the ones it reads off
+  // the PDF, and defaulting any of them would put a made-up invoice number or
+  // payment date on a real payable — so a confident, well-matched invoice still
+  // stops here. The check runs BEFORE the upload, so no orphan attachment is
+  // left on the job.
+  it.each([
+    ["invoiceNumber", { invoiceNumber: null }],
+    ["invoiceDate", { invoiceDate: null }],
+    ["dueDate", { dueDate: null }],
+  ])(
+    "a match that Prime would reject for a missing %s -> Exceptions/Unreadable, before any write",
+    async (_field, override) => {
+      extractInvoiceFields.mockResolvedValue({ ...CLEAN_EXTRACTION, ...override });
+      const message = makeMessage();
+
+      await processMessage(message);
+
+      const invoice = getInvoiceByMessage(message.id)!;
+      expect(invoice.stage).toBe("exception");
+      expect(invoice.exceptionReason).toBe("unreadable");
+      // Matching still succeeded — this is not a matching failure.
+      expect(invoice.primeWorkOrderId).toBe(MATCHING_WORK_ORDER.id);
+      // ...but nothing was uploaded or created, and the audit says which field
+      // stopped it rather than leaving a bare "unreadable" to puzzle over.
+      expect(invoice.primeAttachmentId).toBeNull();
+      expect(invoice.primeApInvoiceId).toBeNull();
+      expect(auditEventTypes(invoice.id)).toContain("pipeline.ap_invoice_fields_missing");
+      expect(auditEventTypes(invoice.id)).not.toContain("prime.upload_attachment.dry_run");
+      expect(moveMessage).toHaveBeenCalledWith(
+        message.id,
+        EXCEPTION_FOLDERS.unreadable,
+        expect.anything(),
+      );
+    },
+  );
+
+  // The jobId comes from the matched work order, not the PDF. A work order
+  // without one cannot be filed against a job, so it must not reach Prime.
+  it("a work order carrying no jobId -> Exceptions/Unreadable, before any write", async () => {
+    const { jobId: _jobId, ...noJob } = MATCHING_WORK_ORDER;
+    findWorkOrdersByPurchaseOrder.mockResolvedValue([noJob]);
+    const message = makeMessage();
+
+    await processMessage(message);
+
+    const invoice = getInvoiceByMessage(message.id)!;
+    expect(invoice.stage).toBe("exception");
+    expect(invoice.exceptionReason).toBe("unreadable");
+    expect(invoice.primeJobId).toBeNull();
+    expect(invoice.primeAttachmentId).toBeNull();
   });
 
   it("non-invoice classification is marked processed and never gets an invoices row", async () => {

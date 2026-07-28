@@ -1,0 +1,13 @@
+-- Prime requires a jobId on BOTH write steps: the attachment is attached to a
+-- Job (`objectType: "Job"`, `objectId: <jobId>`) and AP-invoice create lists
+-- `jobId` as required. Matching resolves a WORK ORDER, and the work order
+-- carries `jobId` in its attributes — verified live 2026-07-28, where
+-- PO21266/PO21267 both resolve to job 08fff8ef… (job number BWC-5126, the same
+-- one printed on the invoices).
+--
+-- Persisted at match time rather than re-fetched at approve time, following the
+-- same rule as every other Prime identifier here: capture it the moment it is
+-- known so a restart resumes instead of re-deriving. This also answers
+-- prime-api-gaps.md Q3 — no separate /jobs lookup is needed, and nothing has to
+-- trust the job number parsed off the PDF.
+ALTER TABLE invoices ADD COLUMN prime_job_id TEXT;

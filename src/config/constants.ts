@@ -36,6 +36,19 @@ export const PRIME_RATE_LIMITS = {
 export const MAX_TRANSIENT_RETRIES = 5;
 
 /**
+ * Attachment upload fields that are business rules rather than per-environment
+ * config. Both read off real production attachments on 2026-07-28: every
+ * attachment carried by an existing AP invoice uses status "Published" (the only
+ * other value in use is "Obsolete") and hangs off the Job — `objectType: "Job"`
+ * with `objectId` equal to that invoice's own jobId, without exception.
+ *
+ * The third field, attachmentTypeId, is tenant data rather than a rule, so it
+ * lives in env (PRIME_ATTACHMENT_TYPE_ID).
+ */
+export const PRIME_ATTACHMENT_STATUS = "Published";
+export const PRIME_ATTACHMENT_OBJECT_TYPE = "Job";
+
+/**
  * How many times to poll Prime's isSynced field after approval before giving
  * up and routing to Exceptions/Xero sync failed as a persistent failure. One
  * check happens per worker tick (not a tight in-call loop), so this many

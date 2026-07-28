@@ -205,6 +205,27 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   `config/constants.ts` is tuned to Prime's published limits (60/min, 5
   concurrent, 5000/day) — don't adjust without confirming new figures against
   Prime's docs.
+
+  **Prime's money model** (read off 15 production AP invoices on 2026-07-28, and
+  the same convention on work orders): `tax` is a **rate** (`0.1000`), `taxTotal`
+  is the GST **amount** Prime calculates itself, and `amount` is the
+  **tax-inclusive total** — 968.00 with taxTotal 88 is 880 ex-GST. So AP-invoice
+  create sends a single inc-GST `amount` and nothing else about tax, and cost
+  matching compares inc-GST to inc-GST. Both writes also require `jobId`, which
+  comes off the matched work order (`prime_job_id`, migration 003) and never from
+  the job number printed on the PDF. Created resources return their id at
+  `data.id`, JSON:API style; every resource carries an integer `version` for
+  optimistic concurrency.
+
+  `approveApInvoice` is the one write still built on a guess, and it is known
+  wrong rather than merely unverified: production holds records with
+  `approvalStatus: "Approved"` and `isSynced: false`, so setting that field alone
+  — exactly what the code does — does **not** trigger Prime's Xero push. Every
+  synced record instead sits at `accountsPayableInvoiceStatus: "Paid"`. Whether
+  the push fires on reaching `"Approved"` or only `"Paid"` is the last real
+  blocker on the live path (prime-api-gaps.md Q6). Live, an invoice would
+  approve, poll `isSynced` `MAX_SYNC_POLL_ATTEMPTS` times, and land in
+  `Exceptions/Xero sync failed`.
 - `extraction/` — OpenRouter chat completion sending the PDF inline, strict
   JSON-only system prompt, `parseModelJson` validates against a Zod schema
   (`schemas.ts`). Low-confidence or unparseable extraction routes to

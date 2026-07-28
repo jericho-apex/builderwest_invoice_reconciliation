@@ -187,6 +187,10 @@ export async function driveInvoice(invoiceId: number): Promise<void> {
 
       setResolvedMatch(invoiceId, {
         primeWorkOrderId: decision.workOrder.id,
+        // Both Prime write steps require the job, and the work order is where it
+        // comes from — captured now rather than re-fetched at approve time, and
+        // never taken from the job number printed on the PDF.
+        primeJobId: decision.workOrder.jobId,
         // Undefined under ASSUME_SUPPLIER_MATCHED — no contact was verified, and
         // recording a guessed one would misrepresent the run. setResolvedMatch
         // COALESCEs, so the column simply stays null.

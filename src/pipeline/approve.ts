@@ -7,7 +7,8 @@ import {
   setSynced,
   recordSyncCheckAttempt,
 } from "../db/repositories/invoices.js";
-import type { AuditLogInput } from "../db/repositories/auditLog.js";
+import type { InvoiceRecord } from "../db/repositories/invoices.js";
+import { appendAuditLog, type AuditLogInput } from "../db/repositories/auditLog.js";
 import { getPdfAttachments } from "../lib/graph/mailbox.js";
 import { moveMessage } from "../lib/graph/folders.js";
 import { uploadAttachment } from "../lib/prime/attachments.js";
@@ -17,6 +18,27 @@ import { routeToException } from "./exception.js";
 type AuditContext = Pick<AuditLogInput, "invoiceId" | "messageId">;
 
 export type ApproveFlowResult = "completed" | "pending_sync" | "exception";
+
+/**
+ * Everything Prime requires across the attachment upload and the AP-invoice
+ * create, checked in one place. `jobId` and `workOrderId` come from matching;
+ * the rest are extracted off the PDF and are all nullable in the extraction
+ * schema, so any of them can genuinely be absent.
+ *
+ * Returns the names of whatever is missing, so the audit row says which field
+ * stopped the invoice rather than just that something did.
+ */
+function missingRequiredFields(invoice: InvoiceRecord): string[] {
+  const required: Array<[string, unknown]> = [
+    ["primeJobId", invoice.primeJobId],
+    ["primeWorkOrderId", invoice.primeWorkOrderId],
+    ["invoiceNumber", invoice.extractedInvoiceNumber],
+    ["invoiceDate", invoice.extractedInvoiceDate],
+    ["dueDate", invoice.extractedDueDate],
+    ["totalAmountCents", invoice.extractedTotalAmountCents],
+  ];
+  return required.filter(([, value]) => value === null || value === undefined).map(([name]) => name);
+}
 
 /**
  * Drives an invoice through the approve flow (PRD §4.1 step 5 / §5.1
@@ -44,6 +66,27 @@ export async function advanceApproveFlow(
 
     switch (invoice.stage) {
       case "matched": {
+        // Prime requires all of these on the two writes ahead. Check them BEFORE
+        // the upload, so a missing field costs nothing rather than leaving an
+        // orphaned attachment on the job that no AP invoice ever references.
+        //
+        // Routing to "unreadable" is deliberate: the field is missing because
+        // extraction could not read it off the PDF, which is exactly the case
+        // that folder — and the one auto-reply asking the supplier to resend —
+        // exists for. Defaulting any of them would put a made-up invoice number
+        // or payment date on a real payable.
+        const missing = missingRequiredFields(invoice);
+        if (missing.length > 0) {
+          appendAuditLog({
+            ...context,
+            eventType: "pipeline.ap_invoice_fields_missing",
+            detail: { missing },
+            isError: true,
+          });
+          await routeToException(invoiceId, invoice.messageId, "unreadable", context);
+          return "exception";
+        }
+
         const pdfAttachments = await getPdfAttachments(invoice.messageId);
         const attachment = pdfAttachments[invoice.attachmentIndex];
         if (!attachment) {
@@ -51,26 +94,36 @@ export async function advanceApproveFlow(
           return "exception";
         }
 
-        const pdfBuffer = Buffer.from(attachment.contentBytes, "base64");
-        const attachmentId = await uploadAttachment(pdfBuffer, attachment.name, context);
+        const attachmentId = await uploadAttachment(
+          {
+            pdf: Buffer.from(attachment.contentBytes, "base64"),
+            filename: attachment.name,
+            jobId: invoice.primeJobId!,
+          },
+          context,
+        );
         setAttachmentUploaded(invoiceId, attachmentId);
         continue;
       }
 
       case "attachment_uploaded": {
-        if (!invoice.primeWorkOrderId || !invoice.primeAttachmentId) {
+        if (!invoice.primeAttachmentId || missingRequiredFields(invoice).length > 0) {
           throw new Error(
-            `advanceApproveFlow: invoice ${invoiceId} missing Prime IDs at stage attachment_uploaded`,
+            `advanceApproveFlow: invoice ${invoiceId} missing Prime IDs or required fields at stage attachment_uploaded`,
           );
         }
 
         const apInvoiceId = await createApInvoice(
           {
-            workOrderId: invoice.primeWorkOrderId,
+            invoiceNumber: invoice.extractedInvoiceNumber!,
+            jobId: invoice.primeJobId!,
+            workOrderId: invoice.primeWorkOrderId!,
             attachmentId: invoice.primeAttachmentId,
-            exTaxAmountCents: invoice.extractedExTaxAmountCents ?? 0,
-            taxAmountCents: invoice.extractedTaxAmountCents ?? 0,
-            totalAmountCents: invoice.extractedTotalAmountCents ?? 0,
+            // The tax-inclusive total — Prime derives the GST itself. See
+            // createApInvoice for the evidence behind that.
+            totalAmountCents: invoice.extractedTotalAmountCents!,
+            invoicedDate: invoice.extractedInvoiceDate!,
+            dueDate: invoice.extractedDueDate!,
           },
           context,
         );
