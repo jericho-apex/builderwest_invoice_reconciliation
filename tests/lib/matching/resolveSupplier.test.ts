@@ -1,56 +1,105 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const findContactByAbn = vi.fn();
-const findContactByName = vi.fn();
+const findContactsByAbn = vi.fn();
+const findContactsByName = vi.fn();
 
 vi.mock("../../../src/lib/prime/contacts.js", () => ({
-  findContactByAbn: (...args: unknown[]) => findContactByAbn(...args),
-  findContactByName: (...args: unknown[]) => findContactByName(...args),
+  findContactsByAbn: (...args: unknown[]) => findContactsByAbn(...args),
+  findContactsByName: (...args: unknown[]) => findContactsByName(...args),
+}));
+
+// Stubbed rather than driven through real env vars so a test can flip the flag
+// mid-file — loadEnv() caches on first call and would otherwise pin whichever
+// value the first test happened to use.
+let assumeSupplierMatched = false;
+vi.mock("../../../src/config/env.js", () => ({
+  loadEnv: () => ({ ASSUME_SUPPLIER_MATCHED: assumeSupplierMatched }),
 }));
 
 const { resolveSupplier } = await import("../../../src/lib/matching/resolveSupplier.js");
 
 const context = { messageId: "msg-1" };
-const contact = { id: "contact_1", name: "Acme Roofing" };
+const VALID_ABN = "51824753556"; // ATO's published example ABN — checksum-valid
+const ryan = { id: "contact_ryan", name: "Ryan Smith" };
+const tobey = { id: "contact_tobey", name: "Tobey Chan" };
 
 describe("resolveSupplier", () => {
   beforeEach(() => {
-    findContactByAbn.mockReset();
-    findContactByName.mockReset();
+    findContactsByAbn.mockReset();
+    findContactsByName.mockReset();
+    assumeSupplierMatched = false;
   });
 
   it("matches by ABN first and never falls back to name when the ABN hits", async () => {
-    findContactByAbn.mockResolvedValue(contact);
+    findContactsByAbn.mockResolvedValue([ryan]);
 
-    const result = await resolveSupplier({ abn: "12345678901", name: "Acme Roofing" }, context);
+    const result = await resolveSupplier({ abn: VALID_ABN, name: "Ryan Smith" }, context);
 
-    expect(result).toEqual({ status: "matched_by_abn", contact });
-    expect(findContactByName).not.toHaveBeenCalled();
+    expect(result).toEqual({ status: "matched_by_abn", contact: ryan });
+    expect(findContactsByName).not.toHaveBeenCalled();
   });
 
-  it("falls back to name when ABN is present but doesn't match", async () => {
-    findContactByAbn.mockResolvedValue(undefined);
-    findContactByName.mockResolvedValue(contact);
+  it("normalizes a formatted ABN before querying Prime", async () => {
+    findContactsByAbn.mockResolvedValue([ryan]);
 
-    const result = await resolveSupplier({ abn: "00000000000", name: "Acme Roofing" }, context);
+    await resolveSupplier({ abn: "51 824 753 556", name: "Ryan Smith" }, context);
 
-    expect(result).toEqual({ status: "matched_by_name", contact });
+    expect(findContactsByAbn).toHaveBeenCalledWith(VALID_ABN, context);
+  });
+
+  // The defect this closes: both dummy invoices print ABN "00 000 000 000" but
+  // come from different suppliers. Querying on it would resolve both to
+  // whichever contact happens to carry the placeholder.
+  it("never queries by an invalid ABN — the placeholder resolves by name instead", async () => {
+    findContactsByName.mockResolvedValue([tobey]);
+
+    const result = await resolveSupplier({ abn: "00 000 000 000", name: "Tobey Chan" }, context);
+
+    expect(result).toEqual({ status: "matched_by_name", contact: tobey });
+    expect(findContactsByAbn).not.toHaveBeenCalled();
+    expect(findContactsByName).toHaveBeenCalledWith("Tobey Chan", context);
+  });
+
+  it("falls back to name when a valid ABN simply isn't in Prime", async () => {
+    findContactsByAbn.mockResolvedValue([]);
+    findContactsByName.mockResolvedValue([ryan]);
+
+    const result = await resolveSupplier({ abn: VALID_ABN, name: "Ryan Smith" }, context);
+
+    expect(result).toEqual({ status: "matched_by_name", contact: ryan });
+  });
+
+  it("treats several contacts sharing one ABN as unresolved, not as the first row", async () => {
+    findContactsByAbn.mockResolvedValue([ryan, tobey]);
+    findContactsByName.mockResolvedValue([]);
+
+    const result = await resolveSupplier({ abn: VALID_ABN, name: "Ryan Smith" }, context);
+
+    expect(result).toEqual({ status: "not_found" });
+  });
+
+  it("treats several contacts sharing one name as unresolved", async () => {
+    findContactsByName.mockResolvedValue([ryan, tobey]);
+
+    const result = await resolveSupplier({ abn: null, name: "Ryan Smith" }, context);
+
+    expect(result).toEqual({ status: "not_found" });
   });
 
   it("skips the ABN lookup entirely when no ABN was extracted", async () => {
-    findContactByName.mockResolvedValue(contact);
+    findContactsByName.mockResolvedValue([ryan]);
 
-    const result = await resolveSupplier({ abn: null, name: "Acme Roofing" }, context);
+    const result = await resolveSupplier({ abn: null, name: "Ryan Smith" }, context);
 
-    expect(result).toEqual({ status: "matched_by_name", contact });
-    expect(findContactByAbn).not.toHaveBeenCalled();
+    expect(result).toEqual({ status: "matched_by_name", contact: ryan });
+    expect(findContactsByAbn).not.toHaveBeenCalled();
   });
 
   it("returns not_found when neither ABN nor name resolve, without guessing", async () => {
-    findContactByAbn.mockResolvedValue(undefined);
-    findContactByName.mockResolvedValue(undefined);
+    findContactsByAbn.mockResolvedValue([]);
+    findContactsByName.mockResolvedValue([]);
 
-    const result = await resolveSupplier({ abn: "999", name: "Unknown Co" }, context);
+    const result = await resolveSupplier({ abn: VALID_ABN, name: "Unknown Co" }, context);
 
     expect(result).toEqual({ status: "not_found" });
   });
@@ -59,7 +108,231 @@ describe("resolveSupplier", () => {
     const result = await resolveSupplier({ abn: null, name: null }, context);
 
     expect(result).toEqual({ status: "not_found" });
-    expect(findContactByAbn).not.toHaveBeenCalled();
-    expect(findContactByName).not.toHaveBeenCalled();
+    expect(findContactsByAbn).not.toHaveBeenCalled();
+    expect(findContactsByName).not.toHaveBeenCalled();
+  });
+
+  // Builderwest's production Prime holds four contacts named "Ryan Smith", so
+  // their own auto-approve invoice cannot resolve by name alone. The matched
+  // work order is assigned to exactly one of them, which breaks the tie.
+  describe("work-order assignment tie-break", () => {
+    const ryanUser = { id: "contact_ryan_user", name: "Ryan Smith" };
+    const ryanClient = { id: "contact_ryan_client", name: "Ryan Smith" };
+    const ryanCustomer = { id: "contact_ryan_customer", name: "Ryan Smith" };
+
+    it("resolves to the contact the work order is assigned to", async () => {
+      findContactsByName.mockResolvedValue([ryanUser, ryanClient, ryanCustomer]);
+
+      const result = await resolveSupplier(
+        { abn: null, name: "Ryan Smith", workOrderAssignedId: "contact_ryan_user" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "matched_by_assignment", contact: ryanUser });
+    });
+
+    // The property that makes this not a dressed-up data[0]: the tie-break can
+    // only choose among contacts the INVOICE named. An assignee whose name is
+    // nothing like the supplier on the invoice must never be selected.
+    it("does not select an assignee whose name the invoice never mentioned", async () => {
+      findContactsByName.mockResolvedValue([ryanUser, ryanClient]);
+
+      const result = await resolveSupplier(
+        { abn: null, name: "Ryan Smith", workOrderAssignedId: "contact_someone_else" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "not_found" });
+    });
+
+    // No name match means no corroboration at all — the assignment alone is not
+    // evidence that this work order's assignee sent this invoice.
+    it("never fires when the name matched nobody", async () => {
+      findContactsByName.mockResolvedValue([]);
+
+      const result = await resolveSupplier(
+        { abn: null, name: "Unknown Co", workOrderAssignedId: "contact_ryan_user" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "not_found" });
+    });
+
+    it("leaves an unambiguous single name match reported as matched_by_name", async () => {
+      findContactsByName.mockResolvedValue([tobey]);
+
+      const result = await resolveSupplier(
+        { abn: null, name: "Tobey Chan", workOrderAssignedId: "contact_ryan_user" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "matched_by_name", contact: tobey });
+    });
+
+    it("stays unresolved when the work order has no assignee to break the tie with", async () => {
+      findContactsByName.mockResolvedValue([ryanUser, ryanClient]);
+
+      const result = await resolveSupplier({ abn: null, name: "Ryan Smith" }, context);
+
+      expect(result).toEqual({ status: "not_found" });
+    });
+
+    it("still prefers a genuine ABN match over the tie-break", async () => {
+      findContactsByAbn.mockResolvedValue([ryanClient]);
+
+      const result = await resolveSupplier(
+        { abn: VALID_ABN, name: "Ryan Smith", workOrderAssignedId: "contact_ryan_user" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: ryanClient });
+      expect(findContactsByName).not.toHaveBeenCalled();
+    });
+  });
+
+  // ASSUME_SUPPLIER_MATCHED exists only because production Prime holds four
+  // contacts named "Ryan Smith", so the client's own auto-approve invoice cannot
+  // resolve a supplier. It must change what an UNRESOLVED result means and
+  // nothing else — never which lookups run, never a genuine match.
+  describe("with ASSUME_SUPPLIER_MATCHED on", () => {
+    beforeEach(() => {
+      assumeSupplierMatched = true;
+    });
+
+    it("assumes the supplier when several contacts share the name, reporting how many", async () => {
+      findContactsByName.mockResolvedValue([ryan, tobey]);
+
+      const result = await resolveSupplier({ abn: null, name: "Ryan Smith" }, context);
+
+      expect(result).toEqual({ status: "assumed", candidateCount: 2 });
+      // Still asked Prime — the flag forgives the answer, it does not skip the question.
+      expect(findContactsByName).toHaveBeenCalledWith("Ryan Smith", context);
+    });
+
+    it("assumes the supplier when Prime has nobody by that name", async () => {
+      findContactsByName.mockResolvedValue([]);
+
+      const result = await resolveSupplier({ abn: null, name: "Unknown Co" }, context);
+
+      expect(result).toEqual({ status: "assumed", candidateCount: 0 });
+    });
+
+    it("still reports a genuine single name match as matched_by_name", async () => {
+      findContactsByName.mockResolvedValue([tobey]);
+
+      const result = await resolveSupplier({ abn: null, name: "Tobey Chan" }, context);
+
+      expect(result).toEqual({ status: "matched_by_name", contact: tobey });
+    });
+
+    it("still prefers a genuine ABN match over assuming", async () => {
+      findContactsByAbn.mockResolvedValue([ryan]);
+
+      const result = await resolveSupplier({ abn: VALID_ABN, name: "Ryan Smith" }, context);
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: ryan });
+      expect(findContactsByName).not.toHaveBeenCalled();
+    });
+
+    it("assumes without a contact — there is no verified one to hand back", async () => {
+      findContactsByName.mockResolvedValue([ryan, tobey]);
+
+      const result = await resolveSupplier({ abn: null, name: "Ryan Smith" }, context);
+
+      expect(result).not.toHaveProperty("contact");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Verified live 2026-07-29: production Prime stores contact ABNs in the ATO's
+  // grouped format. Prime's `q=` is an exact `eq`, so querying only the digits
+  // (which is all this did) could never hit, and every real supplier fell through
+  // to a name lookup that misses too — invoices print legal names ("Hutchy
+  // Ceilings Pty Ltd") where Prime holds trading names ("Hutchy Ceilings"). All
+  // three of the client's real supplier invoices routed to Exceptions/Supplier
+  // not found for that reason alone.
+  // ---------------------------------------------------------------------------
+  describe("the ABN format bridge", () => {
+    const hutchy = { id: "contact_hutchy", name: "Hutchy Ceilings", abn: "68 628 819 741" };
+
+    it("finds a contact whose ABN Prime stores grouped", async () => {
+      findContactsByAbn.mockImplementation((abn: string) =>
+        Promise.resolve(abn === "68 628 819 741" ? [hutchy] : []),
+      );
+
+      const result = await resolveSupplier(
+        { abn: "68 628 819 741", name: "Hutchy Ceilings Pty Ltd" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: hutchy });
+      // The name never had to be right — which is the point, since it isn't.
+      expect(findContactsByName).not.toHaveBeenCalled();
+    });
+
+    it("still finds one stored as bare digits", async () => {
+      findContactsByAbn.mockImplementation((abn: string) =>
+        Promise.resolve(abn === "68628819741" ? [hutchy] : []),
+      );
+
+      const result = await resolveSupplier({ abn: "68628819741", name: null }, context);
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: hutchy });
+    });
+
+    // Beale4's invoice prints "3910 8785 824" — valid digits, non-standard
+    // grouping. Re-grouping to the ATO format is what reaches the stored value.
+    it("recovers the stored form from a non-standard printed grouping", async () => {
+      const beale = { id: "contact_beale", name: "Beale 4 Maintenance" };
+      findContactsByAbn.mockImplementation((abn: string) =>
+        Promise.resolve(abn === "39 108 785 824" ? [beale] : []),
+      );
+
+      const result = await resolveSupplier({ abn: "3910 8785 824", name: "Beale4" }, context);
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: beale });
+    });
+
+    // Same reasoning as resolveWorkOrder's union: one contact returned by both
+    // queries must count once, or a resolvable supplier would look ambiguous and
+    // be sent to a human for no reason.
+    it("counts a contact returned by both formats once", async () => {
+      findContactsByAbn.mockResolvedValue([hutchy]);
+
+      const result = await resolveSupplier({ abn: "68 628 819 741", name: null }, context);
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: hutchy });
+      expect(findContactsByAbn).toHaveBeenCalledTimes(2);
+    });
+
+    it("queries the grouped form first, so the common case costs one call", async () => {
+      findContactsByAbn.mockResolvedValue([]);
+
+      await resolveSupplier({ abn: "68628819741", name: null }, context);
+
+      expect(findContactsByAbn).toHaveBeenNthCalledWith(1, "68 628 819 741", context);
+      expect(findContactsByAbn).toHaveBeenNthCalledWith(2, "68628819741", context);
+    });
+
+    // Bridging a format must not become bridging to a different business: two
+    // DIFFERENT contacts carrying the same ABN is a data problem in Prime, and
+    // the exactly-one rule still sends it to a human.
+    it("does not resolve when the two formats name different contacts", async () => {
+      findContactsByAbn.mockImplementation((abn: string) =>
+        Promise.resolve(abn === "68 628 819 741" ? [hutchy] : [tobey]),
+      );
+
+      const result = await resolveSupplier({ abn: "68628819741", name: null }, context);
+
+      expect(result).toEqual({ status: "not_found" });
+    });
+
+    it("still never queries at all on a checksum-invalid ABN", async () => {
+      findContactsByName.mockResolvedValue([]);
+
+      await resolveSupplier({ abn: "00 000 000 000", name: "Anyone" }, context);
+
+      expect(findContactsByAbn).not.toHaveBeenCalled();
+    });
   });
 });

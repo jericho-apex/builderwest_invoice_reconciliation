@@ -1,6 +1,6 @@
 import { loadEnv } from "../../config/env.js";
 import { logger } from "../../log/logger.js";
-import { graphRequest } from "./httpClient.js";
+import { graphRequest, GraphApiError } from "./httpClient.js";
 import { appendAuditLog, type AuditLogInput } from "../../db/repositories/auditLog.js";
 
 type AuditContext = Pick<AuditLogInput, "invoiceId" | "messageId">;
@@ -50,10 +50,56 @@ async function createFolder(name: string, parentId: string | undefined): Promise
 // resolution.
 const folderIdCache = new Map<string, string>();
 
+// In-flight resolutions, keyed the same way. The cache above only helps once a
+// path has FINISHED resolving; invoices are driven concurrently
+// (PRIME_RATE_LIMITS.maxConcurrent), so several can be midway through resolving
+// the same path with nothing resolved to cache yet. Sharing the promise means
+// one lookup-and-create per path per process, no matter how many callers ask at
+// once.
+const inFlightResolutions = new Map<string, Promise<string>>();
+
+/** Resolves one path segment under a known parent, creating it if absent. */
+async function resolveSegment(name: string, parentId: string | undefined): Promise<string> {
+  const existing = await findFolderByName(name, parentId);
+  if (existing) {
+    return existing;
+  }
+
+  try {
+    const created = await createFolder(name, parentId);
+    logger.info("created Outlook folder", { displayName: name });
+    return created;
+  } catch (error) {
+    // 409 means the folder appeared between our lookup and our create — either
+    // another process, or Graph's own list indexing lagging its writes. It is
+    // success reported as a conflict, so look the folder up again and use it.
+    //
+    // This crashed a live tick: two invoices routing to different
+    // Exceptions/* subfolders both created the "Exceptions" parent at once, one
+    // won, and the loser's 409 stranded its invoice at a terminal stage with the
+    // email still in the Inbox.
+    if (error instanceof GraphApiError && error.status === 409) {
+      const raced = await findFolderByName(name, parentId);
+      if (raced) {
+        logger.info("Outlook folder already existed (409, resolved by lookup)", {
+          displayName: name,
+        });
+        return raced;
+      }
+    }
+    throw error;
+  }
+}
+
 /**
  * Resolves a (possibly nested) Outlook folder path to its Graph folder ID,
  * creating any missing segments along the way — idempotent, per PRD §4.5
  * ("the app creates these subfolders via Graph if they do not exist").
+ *
+ * Recursive rather than iterative so each ANCESTOR path goes through this same
+ * function, and therefore through the same cache and in-flight dedupe: two
+ * callers racing for "Exceptions/Cost mismatch" and "Exceptions/No work order"
+ * share one resolution of "Exceptions" between them.
  */
 export async function getOrCreateFolderId(folderPath: string): Promise<string> {
   const cached = folderIdCache.get(folderPath);
@@ -61,33 +107,28 @@ export async function getOrCreateFolderId(folderPath: string): Promise<string> {
     return cached;
   }
 
+  const alreadyResolving = inFlightResolutions.get(folderPath);
+  if (alreadyResolving) {
+    return alreadyResolving;
+  }
+
   const segments = folderPath.split("/");
-  let parentId: string | undefined;
-  let accumulatedPath = "";
+  const leaf = segments[segments.length - 1]!;
+  const parentPath = segments.slice(0, -1).join("/");
 
-  for (const segment of segments) {
-    accumulatedPath = accumulatedPath ? `${accumulatedPath}/${segment}` : segment;
+  const resolution = (async () => {
+    const parentId = parentPath ? await getOrCreateFolderId(parentPath) : undefined;
+    const folderId = await resolveSegment(leaf, parentId);
+    folderIdCache.set(folderPath, folderId);
+    return folderId;
+  })().finally(() => {
+    // Cleared on failure too, so a transient error doesn't poison the path for
+    // the rest of the process's life.
+    inFlightResolutions.delete(folderPath);
+  });
 
-    const cachedSegment = folderIdCache.get(accumulatedPath);
-    if (cachedSegment) {
-      parentId = cachedSegment;
-      continue;
-    }
-
-    let folderId = await findFolderByName(segment, parentId);
-    if (!folderId) {
-      folderId = await createFolder(segment, parentId);
-      logger.info("created Outlook folder", { folderPath: accumulatedPath });
-    }
-
-    folderIdCache.set(accumulatedPath, folderId);
-    parentId = folderId;
-  }
-
-  if (!parentId) {
-    throw new Error(`Failed to resolve or create folder path: ${folderPath}`);
-  }
-  return parentId;
+  inFlightResolutions.set(folderPath, resolution);
+  return resolution;
 }
 
 /** Moves a message into the given (possibly nested) Outlook folder path. */

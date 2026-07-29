@@ -2,10 +2,13 @@
 
 Automates the trade (supplier) invoice reconciliation stage of Builderwest's claim
 lifecycle: polls an invoice mailbox, extracts invoice fields, matches them against
-Prime Ecosystem work orders, auto-approves clean matches, verifies Prime's existing
-Xero push succeeded, and routes anything uncertain to reason-specific Outlook
-folders. No dashboard, no review UI — accounts staff work the Outlook folders
-directly.
+Prime Ecosystem work orders, auto-approves clean matches, and routes anything
+uncertain to reason-specific Outlook folders. No dashboard, no review UI — accounts
+staff work the Outlook folders directly.
+
+It **stops at approved**. Pushing to Xero stays with Builderwest's existing finance
+process, which does it when an invoice is paid — the pilot does not touch that step
+(see `docs/prime-api-gaps.md` Q6 for the production evidence behind that boundary).
 
 Full design and rationale: see the project's implementation plan (shared separately
 with the team) or `Builderwest_Phase1_PRD.md.pdf`.
@@ -42,12 +45,18 @@ specifically to make development safe without a sandbox:
   creation, approval, `isSynced` poll) without calling any Prime write endpoint.
   Keep this on until you've manually reviewed dry-run output for a batch of
   synthetic test invoices.
-- **`PRIME_TEST_WORK_ORDER_ID`** — a dedicated, clearly-labeled dummy work order in
-  production Prime, used only once dry-run is turned off for live write-path
-  testing. Requires written authorization from Builderwest/Prime first, and an
-  agreed process for cleaning up (voiding/deleting) test invoices afterward,
-  including reversing anything that reached Xero. **Never point this at a real
-  customer work order.**
+- **`PRIME_TEST_WORK_ORDER_IDS`** — the comma-separated list of production Prime
+  work orders that live writes are **fenced to**, used once dry-run is turned off
+  for live write-path testing. This is enforced in code, not just documented: an
+  invoice matching any other work order is refused *before* the attachment upload
+  and routed to `Exceptions/Write blocked`, so it leaves nothing behind in Prime.
+  Empty means unrestricted (the go-live setting), and the worker logs a warning
+  when that is combined with live writes.
+
+  Builderwest authorized live write testing on 2026-07-29 against test claim
+  `BWC-WA-6797`, whose dummy work orders Tobey Chan created; cleanup in Prime and
+  Xero is theirs to do, so **tell them when a run has finished**. **Never point
+  this at a real customer work order.**
 
 ## Data & audit trail
 

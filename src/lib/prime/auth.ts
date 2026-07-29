@@ -25,18 +25,19 @@ interface PrimeTokenResponse {
  * OAuth2 password grant against Prime's auth endpoint (PRD §5.1: client_id +
  * client_secret + username + password -> bearer token).
  *
- * ASSUMPTION FLAGGED FOR VERIFICATION: the exact token endpoint path and
- * response field names below follow the standard OAuth2 Resource Owner
- * Password Credentials shape, since the PRD excerpt available while building
- * this did not specify Prime's exact endpoint path. Confirm this against
- * Prime's actual API reference (from the vendor) before relying on it — if
- * the path or field names differ, only this function needs to change.
+ * VERIFIED LIVE 2026-07-28 against production Prime: `POST {api_uri}/oauth/token`
+ * with the form fields below returns 200 and
+ * `{ token_type, expires_in, access_token, refresh_token }` (expires_in 21600s
+ * = 6h), and the resulting bearer is accepted on `/work-orders` and
+ * `/contacts`. The `Accept: application/vnd.api.v2+json` header is documented
+ * as required on the token request too, not just on resource calls.
  */
 async function fetchNewToken(): Promise<PrimeToken> {
   const env = loadEnv();
   // NB: concatenate, don't use `new URL("/oauth/token", base)` — a leading-slash
-  // path resets to the host root and drops PRIME_BASE_URL's "/api/prime/v2"
-  // path segment entirely (verified against the base URL in .env.example).
+  // path resets to the host root and drops PRIME_BASE_URL's "/api.prime/v2"
+  // path segment entirely. Confirmed live: the host-root path 404s, the full
+  // base URL + "/oauth/token" is the one that issues a token.
   const tokenUrl = new URL(`${env.PRIME_BASE_URL.replace(/\/$/, "")}/oauth/token`);
 
   const body = new URLSearchParams({
@@ -49,7 +50,10 @@ async function fetchNewToken(): Promise<PrimeToken> {
 
   const response = await fetch(tokenUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/vnd.api.v2+json",
+    },
     body,
   });
 

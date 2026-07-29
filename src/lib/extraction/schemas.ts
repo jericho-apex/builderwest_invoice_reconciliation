@@ -15,9 +15,25 @@ export const InvoiceExtractionSchema = z.object({
   invoiceNumber: z.string().nullable(),
   invoiceDate: z.string().nullable(),
   dueDate: z.string().nullable(),
+  // Read when the invoice states payment TERMS but leaves the due-date cell
+  // empty, as 26.pdf (Hutchy Ceilings, "Due in 30 Days") does. The model reads
+  // the number; extraction/dueDate.ts does the arithmetic, because a derived
+  // payment date has to be reproducible by whoever audits it.
+  paymentTermsDays: z.number().nullable(),
   exTaxAmount: z.number().nullable(),
   taxAmount: z.number().nullable(),
   totalAmount: z.number().nullable(),
+  // The purchase order number is the ONLY identifier work-order matching keys
+  // off (see matching/resolveWorkOrder.ts) — the client's invoices print a PO
+  // per work order, whereas the job number is shared across every work order
+  // on the same job and so cannot identify one.
+  purchaseOrderNumber: z.string().nullable(),
+  // Extracted and persisted but deliberately NOT used for matching: it's the
+  // most likely route to the `jobId` that attachment upload and AP-invoice
+  // create both require (prime-api-gaps.md Q3).
+  jobNumber: z.string().nullable(),
+  // Kept for invoices that print an explicit work-order reference. Audit data
+  // only — it does not drive resolution.
   workOrderRef: z.string().nullable(),
   confidence: z.number().min(0).max(1),
 });

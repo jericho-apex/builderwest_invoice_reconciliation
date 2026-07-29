@@ -1,4 +1,3 @@
-import { loadEnv } from "../config/env.js";
 import { EXTRACTION_CONFIDENCE_THRESHOLD } from "../config/constants.js";
 import {
   getInvoiceById,
@@ -10,35 +9,77 @@ import {
 import { recordMatchResult } from "../db/repositories/matchResults.js";
 import { appendAuditLog } from "../db/repositories/auditLog.js";
 import { logger } from "../log/logger.js";
+import { dollarsToCents } from "../lib/money.js";
 import { getPdfAttachments } from "../lib/graph/mailbox.js";
 import type { GraphMessageSummary } from "../lib/graph/mailbox.js";
 import { classifyMessage } from "../lib/extraction/classifyMessage.js";
 import { extractInvoiceFields } from "../lib/extraction/extractInvoice.js";
 import type { InvoiceExtraction } from "../lib/extraction/schemas.js";
-import { resolveWorkOrder } from "../lib/matching/resolveWorkOrder.js";
-import { resolveSupplier } from "../lib/matching/resolveSupplier.js";
-import { compareCost } from "../lib/matching/compareCost.js";
+import { resolveDueDate, type ResolvedDueDate } from "../lib/extraction/dueDate.js";
+import {
+  choosePurchaseOrder,
+  type ChosenPurchaseOrder,
+} from "../lib/matching/purchaseOrder.js";
+import { decideMatch } from "./decide.js";
 import { passesStructuralPreFilter } from "./filter.js";
 import { routeToException } from "./exception.js";
 import { advanceApproveFlow } from "./approve.js";
 import { markProcessed } from "../db/repositories/processedMessages.js";
 
 function toCents(dollars: number | null): number | undefined {
-  return dollars === null ? undefined : Math.round(dollars * 100);
+  return dollars === null ? undefined : dollarsToCents(dollars);
 }
 
-function mapExtractionToFields(extraction: InvoiceExtraction): ExtractedFields {
+interface DerivedExtraction {
+  fields: ExtractedFields;
+  purchaseOrder: ChosenPurchaseOrder;
+  dueDate: ResolvedDueDate;
+}
+
+/**
+ * The extraction as persisted, with the two interpretations the raw model output
+ * needs before anything downstream can use it:
+ *
+ * - WHICH FIELD HOLDS THE PO. 369.pdf prints its PO under the label "WO No:",
+ *   and the prompt tells the model workOrderRef is a separate field — so the PO
+ *   arrives in the wrong slot. choosePurchaseOrder recovers it, never overriding
+ *   a PO the model did read.
+ * - THE DUE DATE. 26.pdf states terms ("Due in 30 Days") and prints no date, and
+ *   approve.ts cannot write an AP invoice without one.
+ *
+ * Both are recorded in the audit trail by the caller: a matching key or a payment
+ * date that came from anywhere other than the obvious field must not be silent.
+ */
+function deriveExtraction(extraction: InvoiceExtraction): DerivedExtraction {
+  const purchaseOrder = choosePurchaseOrder(
+    extraction.purchaseOrderNumber,
+    extraction.workOrderRef,
+  );
+  const dueDate = resolveDueDate(
+    extraction.invoiceDate,
+    extraction.dueDate,
+    extraction.paymentTermsDays,
+  );
+
   return {
-    supplierName: extraction.supplierName ?? undefined,
-    supplierAbn: extraction.supplierAbn ?? undefined,
-    invoiceNumber: extraction.invoiceNumber ?? undefined,
-    invoiceDate: extraction.invoiceDate ?? undefined,
-    dueDate: extraction.dueDate ?? undefined,
-    exTaxAmountCents: toCents(extraction.exTaxAmount),
-    taxAmountCents: toCents(extraction.taxAmount),
-    totalAmountCents: toCents(extraction.totalAmount),
-    workOrderRef: extraction.workOrderRef ?? undefined,
-    confidence: extraction.confidence,
+    purchaseOrder,
+    dueDate,
+    fields: {
+      supplierName: extraction.supplierName ?? undefined,
+      supplierAbn: extraction.supplierAbn ?? undefined,
+      invoiceNumber: extraction.invoiceNumber ?? undefined,
+      invoiceDate: extraction.invoiceDate ?? undefined,
+      dueDate: dueDate.value ?? undefined,
+      exTaxAmountCents: toCents(extraction.exTaxAmount),
+      taxAmountCents: toCents(extraction.taxAmount),
+      totalAmountCents: toCents(extraction.totalAmount),
+      purchaseOrderNumber: purchaseOrder.value ?? undefined,
+      jobNumber: extraction.jobNumber ?? undefined,
+      // Kept as read, even when it is where the PO came from — this column is
+      // the record of what the invoice printed, not of what we matched on.
+      workOrderRef: extraction.workOrderRef ?? undefined,
+      confidence: extraction.confidence,
+    },
   };
 }
 
@@ -57,21 +98,29 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
     if (filterResult.reason !== "already_processed") {
       // Not an invoice candidate at all (no PDF) — mark processed so we
       // don't keep re-fetching and re-checking it on every future poll.
-      markProcessed(message.id);
+      markProcessed(message.id, message.receivedDateTime);
     }
     return;
   }
 
   const classificationContext = { messageId: message.id };
   const classification = await classifyMessage(
-    { subject: message.subject, senderEmail: message.from?.emailAddress.address },
+    {
+      subject: message.subject,
+      senderEmail: message.from?.emailAddress.address,
+      bodyPreview: message.bodyPreview,
+      // The pre-filter has already fetched these, so naming them here is free —
+      // and a filename like "Invoice_12345.pdf" is often the strongest signal on
+      // an email whose subject is nothing but a PO number.
+      attachmentFilenames: filterResult.pdfAttachments.map((attachment) => attachment.name),
+    },
     classificationContext,
   );
 
   if (!classification || classification.category !== "invoice") {
     // Classifier returned a verdict (or unparseable output) — safe to mark
     // processed now so we don't re-classify this message on every future poll.
-    markProcessed(message.id);
+    markProcessed(message.id, message.receivedDateTime);
     appendAuditLog({
       ...classificationContext,
       eventType: "pipeline.not_invoice",
@@ -91,7 +140,7 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
   const invoiceIds = filterResult.pdfAttachments.map((_, attachmentIndex) =>
     getOrCreateInvoice(message.id, attachmentIndex),
   );
-  markProcessed(message.id);
+  markProcessed(message.id, message.receivedDateTime);
 
   for (const invoiceId of invoiceIds) {
     await driveInvoice(invoiceId);
@@ -107,7 +156,7 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
  */
 export async function driveInvoice(invoiceId: number): Promise<void> {
   const invoice = getInvoiceById(invoiceId);
-  if (!invoice || invoice.stage === "synced" || invoice.stage === "exception") {
+  if (!invoice || invoice.stage === "approved" || invoice.stage === "exception") {
     return; // Terminal — nothing to do.
   }
 
@@ -130,92 +179,82 @@ export async function driveInvoice(invoiceId: number): Promise<void> {
           // Still record what we got, even though it's below threshold —
           // useful for a human reviewing Exceptions/Unreadable, and for
           // later confidence-threshold calibration.
-          setExtraction(invoiceId, mapExtractionToFields(extraction));
+          setExtraction(invoiceId, deriveExtraction(extraction).fields);
         }
         await routeToException(invoiceId, invoice.messageId, "unreadable", context);
         return;
       }
 
-      setExtraction(invoiceId, mapExtractionToFields(extraction));
+      const derived = deriveExtraction(extraction);
+      setExtraction(invoiceId, derived.fields);
+
+      // The identifiers, recorded explicitly rather than left implicit in the
+      // extraction blob: the PO is the sole matching key, and the job number
+      // is the evidence we need to answer how a `jobId` is obtained for
+      // attachment upload / AP-invoice create (prime-api-gaps.md Q3).
+      appendAuditLog({
+        ...context,
+        eventType: "pipeline.invoice_identifiers",
+        detail: {
+          purchaseOrderNumber: extraction.purchaseOrderNumber,
+          jobNumber: extraction.jobNumber,
+          workOrderRef: extraction.workOrderRef,
+          // Where the PO that matching will actually use came from. "work_order_ref"
+          // means the model put it in the wrong field and we recovered it.
+          purchaseOrderSource: derived.purchaseOrder.source,
+          purchaseOrderUsed: derived.purchaseOrder.value,
+        },
+      });
+
+      // A payment date the invoice never printed is on the money path, so it goes
+      // on the record rather than being inferred silently.
+      if (derived.dueDate.source === "payment_terms") {
+        appendAuditLog({
+          ...context,
+          eventType: "pipeline.due_date_derived",
+          detail: {
+            invoiceDate: extraction.invoiceDate,
+            paymentTermsDays: extraction.paymentTermsDays,
+            dueDate: derived.dueDate.value,
+          },
+        });
+      }
     }
 
     const afterExtraction = getInvoiceById(invoiceId)!;
 
     if (afterExtraction.stage === "extracted") {
-      const workOrderResolution = await resolveWorkOrder(afterExtraction.extractedWorkOrderRef, context);
-      if (workOrderResolution.status === "not_found") {
-        recordMatchResult({
-          invoiceId,
-          workOrderMatchStatus: "not_found",
-          supplierMatchStatus: "not_found",
-          decision: "exception",
-          exceptionReason: "noWorkOrder",
-        });
-        await routeToException(invoiceId, invoice.messageId, "noWorkOrder", context);
-        return;
-      }
-
-      const supplierResolution = await resolveSupplier(
-        { abn: afterExtraction.extractedSupplierAbn, name: afterExtraction.extractedSupplierName },
+      // decide.ts computes; this function owns every persisted consequence.
+      const decision = await decideMatch(
+        {
+          purchaseOrderNumber: afterExtraction.extractedPurchaseOrderNumber,
+          supplierAbn: afterExtraction.extractedSupplierAbn,
+          supplierName: afterExtraction.extractedSupplierName,
+          totalAmountCents: afterExtraction.extractedTotalAmountCents ?? 0,
+        },
         context,
       );
-      if (supplierResolution.status === "not_found") {
-        recordMatchResult({
-          invoiceId,
-          workOrderMatchStatus: "matched",
-          workOrderId: workOrderResolution.workOrder.id,
-          supplierMatchStatus: "not_found",
-          decision: "exception",
-          exceptionReason: "supplierNotFound",
-        });
-        await routeToException(invoiceId, invoice.messageId, "supplierNotFound", context);
+
+      recordMatchResult({ invoiceId, ...decision.matchResult });
+      for (const event of decision.auditEvents) {
+        appendAuditLog({ ...context, ...event });
+      }
+
+      if (decision.outcome === "exception") {
+        await routeToException(invoiceId, invoice.messageId, decision.reason, context);
         return;
       }
 
-      const env = loadEnv();
-      const costResult = compareCost(
-        afterExtraction.extractedTotalAmountCents ?? 0,
-        workOrderResolution.workOrder,
-        env.COST_FIELD,
-        env.COST_TOLERANCE_MODE,
-        env.COST_TOLERANCE_VALUE,
-      );
-
-      if (!costResult.withinTolerance) {
-        recordMatchResult({
-          invoiceId,
-          workOrderMatchStatus: "matched",
-          workOrderId: workOrderResolution.workOrder.id,
-          supplierMatchStatus: supplierResolution.status,
-          supplierContactId: supplierResolution.contact.id,
-          costFieldUsed: costResult.costField,
-          invoiceTotalCents: costResult.invoiceTotalCents,
-          workOrderCostCents: costResult.workOrderCostCents,
-          costDifferenceCents: costResult.differenceCents,
-          withinTolerance: false,
-          decision: "exception",
-          exceptionReason: "costMismatch",
-        });
-        await routeToException(invoiceId, invoice.messageId, "costMismatch", context);
-        return;
-      }
-
-      recordMatchResult({
-        invoiceId,
-        workOrderMatchStatus: "matched",
-        workOrderId: workOrderResolution.workOrder.id,
-        supplierMatchStatus: supplierResolution.status,
-        supplierContactId: supplierResolution.contact.id,
-        costFieldUsed: costResult.costField,
-        invoiceTotalCents: costResult.invoiceTotalCents,
-        workOrderCostCents: costResult.workOrderCostCents,
-        costDifferenceCents: costResult.differenceCents,
-        withinTolerance: true,
-        decision: "approve",
-      });
       setResolvedMatch(invoiceId, {
-        primeWorkOrderId: workOrderResolution.workOrder.id,
-        primeContactId: supplierResolution.contact.id,
+        primeWorkOrderId: decision.workOrder.id,
+        // Both Prime write steps require the job, and the work order is where it
+        // comes from — captured now rather than re-fetched at approve time, and
+        // never taken from the job number printed on the PDF.
+        primeJobId: decision.workOrder.jobId,
+        // Undefined under ASSUME_SUPPLIER_MATCHED — no contact was verified, and
+        // recording a guessed one would misrepresent the run. setResolvedMatch
+        // COALESCEs, so the column simply stays null.
+        primeContactId: decision.contact?.id,
       });
     }
 

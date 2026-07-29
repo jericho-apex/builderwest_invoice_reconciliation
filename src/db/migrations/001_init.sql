@@ -65,10 +65,12 @@ CREATE TABLE match_results (
   id                     INTEGER PRIMARY KEY AUTOINCREMENT,
   invoice_id             INTEGER NOT NULL REFERENCES invoices (id),
 
-  work_order_match_status TEXT NOT NULL, -- 'matched' | 'not_found'
+  work_order_match_status TEXT NOT NULL, -- 'matched' | 'not_found' | 'ambiguous' (>1 work order matched the PO)
   work_order_id           TEXT,
 
-  supplier_match_status   TEXT NOT NULL, -- 'matched_by_abn' | 'matched_by_name' | 'not_found'
+  -- 'not_attempted' = the work order didn't resolve, so supplier resolution never ran;
+  -- 'not_found' means Prime was asked and had nobody. Keep the two apart when triaging.
+  supplier_match_status   TEXT NOT NULL, -- 'matched_by_abn' | 'matched_by_name' | 'not_found' | 'not_attempted'
   supplier_contact_id     TEXT,
 
   cost_field_used         TEXT,          -- 'cost' | 'costTaxTotal' (config value, see COST_FIELD)

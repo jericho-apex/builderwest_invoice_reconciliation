@@ -5,14 +5,17 @@ import type { ExceptionReason } from "../../config/constants.js";
 // happens BEFORE an invoices row is created at all — every row that exists
 // has, by construction, already passed classification as "invoice", so
 // there is no separate "classified" stage to persist.
+// `approved` is the TERMINAL SUCCESS stage: the pipeline stops at approval and
+// does not wait for Prime's Xero push — see the note above
+// EXTRACTION_CONFIDENCE_THRESHOLD in config/constants.ts for why. The earlier
+// `approved_pending_sync` and `synced` stages are gone with it.
 export const STAGES = [
   "received",
   "extracted",
   "matched",
   "attachment_uploaded",
   "ap_created",
-  "approved_pending_sync",
-  "synced",
+  "approved",
   "exception",
 ] as const;
 
@@ -22,8 +25,7 @@ export type Stage = (typeof STAGES)[number];
 const POST_WRITE_STAGES: ReadonlySet<Stage> = new Set([
   "attachment_uploaded",
   "ap_created",
-  "approved_pending_sync",
-  "synced",
+  "approved",
 ]);
 
 export interface ExtractedFields {
@@ -35,6 +37,10 @@ export interface ExtractedFields {
   exTaxAmountCents?: number;
   taxAmountCents?: number;
   totalAmountCents?: number;
+  /** The only identifier work-order matching keys off — see matching/resolveWorkOrder.ts. */
+  purchaseOrderNumber?: string;
+  /** Captured for context and for the open `jobId` question; never used to match. */
+  jobNumber?: string;
   workOrderRef?: string;
   confidence: number;
 }
@@ -52,9 +58,13 @@ export interface InvoiceRecord {
   extractedExTaxAmountCents: number | null;
   extractedTaxAmountCents: number | null;
   extractedTotalAmountCents: number | null;
+  extractedPurchaseOrderNumber: string | null;
+  extractedJobNumber: string | null;
   extractedWorkOrderRef: string | null;
   extractionConfidence: number | null;
   primeWorkOrderId: string | null;
+  /** The job the work order belongs to — required by both Prime write steps. */
+  primeJobId: string | null;
   primeContactId: string | null;
   primeAttachmentId: string | null;
   primeApInvoiceId: string | null;
@@ -81,9 +91,12 @@ interface InvoiceRow {
   extracted_ex_tax_amount_cents: number | null;
   extracted_tax_amount_cents: number | null;
   extracted_total_amount_cents: number | null;
+  extracted_purchase_order_number: string | null;
+  extracted_job_number: string | null;
   extracted_work_order_ref: string | null;
   extraction_confidence: number | null;
   prime_work_order_id: string | null;
+  prime_job_id: string | null;
   prime_contact_id: string | null;
   prime_attachment_id: string | null;
   prime_ap_invoice_id: string | null;
@@ -111,9 +124,12 @@ function mapRow(row: InvoiceRow): InvoiceRecord {
     extractedExTaxAmountCents: row.extracted_ex_tax_amount_cents,
     extractedTaxAmountCents: row.extracted_tax_amount_cents,
     extractedTotalAmountCents: row.extracted_total_amount_cents,
+    extractedPurchaseOrderNumber: row.extracted_purchase_order_number,
+    extractedJobNumber: row.extracted_job_number,
     extractedWorkOrderRef: row.extracted_work_order_ref,
     extractionConfidence: row.extraction_confidence,
     primeWorkOrderId: row.prime_work_order_id,
+    primeJobId: row.prime_job_id,
     primeContactId: row.prime_contact_id,
     primeAttachmentId: row.prime_attachment_id,
     primeApInvoiceId: row.prime_ap_invoice_id,
@@ -187,7 +203,7 @@ export function getOrCreateInvoice(messageId: string, attachmentIndex = 0): numb
  */
 export function getInFlightInvoices(): InvoiceRecord[] {
   const rows = getDb()
-    .prepare<[], InvoiceRow>("SELECT * FROM invoices WHERE stage NOT IN ('synced', 'exception')")
+    .prepare<[], InvoiceRow>("SELECT * FROM invoices WHERE stage NOT IN ('approved', 'exception')")
     .all();
   return rows.map(mapRow);
 }
@@ -210,6 +226,8 @@ export function setExtraction(id: number, fields: ExtractedFields): void {
          extracted_ex_tax_amount_cents = @exTaxAmountCents,
          extracted_tax_amount_cents = @taxAmountCents,
          extracted_total_amount_cents = @totalAmountCents,
+         extracted_purchase_order_number = @purchaseOrderNumber,
+         extracted_job_number = @jobNumber,
          extracted_work_order_ref = @workOrderRef,
          extraction_confidence = @confidence
        WHERE id = @id`,
@@ -224,6 +242,8 @@ export function setExtraction(id: number, fields: ExtractedFields): void {
       exTaxAmountCents: fields.exTaxAmountCents ?? null,
       taxAmountCents: fields.taxAmountCents ?? null,
       totalAmountCents: fields.totalAmountCents ?? null,
+      purchaseOrderNumber: fields.purchaseOrderNumber ?? null,
+      jobNumber: fields.jobNumber ?? null,
       workOrderRef: fields.workOrderRef ?? null,
       confidence: fields.confidence,
     });
@@ -232,19 +252,21 @@ export function setExtraction(id: number, fields: ExtractedFields): void {
 
 export function setResolvedMatch(
   id: number,
-  match: { primeWorkOrderId?: string; primeContactId?: string },
+  match: { primeWorkOrderId?: string; primeJobId?: string; primeContactId?: string },
 ): void {
   getDb()
     .prepare(
       `UPDATE invoices SET
          stage = 'matched',
          prime_work_order_id = COALESCE(@primeWorkOrderId, prime_work_order_id),
+         prime_job_id = COALESCE(@primeJobId, prime_job_id),
          prime_contact_id = COALESCE(@primeContactId, prime_contact_id)
        WHERE id = @id`,
     )
     .run({
       id,
       primeWorkOrderId: match.primeWorkOrderId ?? null,
+      primeJobId: match.primeJobId ?? null,
       primeContactId: match.primeContactId ?? null,
     });
   touch(id);
@@ -266,37 +288,18 @@ export function setApInvoiceCreated(id: number, primeApInvoiceId: string): void 
   touch(id);
 }
 
-export function setApprovedPendingSync(id: number): void {
-  setStage(id, "approved_pending_sync");
-}
-
-export function recordSyncCheckAttempt(id: number): void {
-  getDb()
-    .prepare(
-      `UPDATE invoices SET
-         sync_attempt_count = sync_attempt_count + 1,
-         last_sync_check_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ?`,
-    )
-    .run(id);
-  touch(id);
-}
-
-export function setSynced(
-  id: number,
-  synced: { financeSystemName: string; financeSystemReference: string },
-): void {
-  getDb()
-    .prepare(
-      `UPDATE invoices SET
-         stage = 'synced',
-         is_synced = 1,
-         synced_finance_system_name = @financeSystemName,
-         synced_finance_system_reference = @financeSystemReference
-       WHERE id = @id`,
-    )
-    .run({ id, ...synced });
-  touch(id);
+/**
+ * Terminal success. The invoice is approved in Prime and the pipeline's work is
+ * finished — Builderwest's finance process owns the Xero push from here.
+ *
+ * The `is_synced`, `sync_attempt_count`, `last_sync_check_at` and
+ * `synced_finance_system_*` columns are left in place but are no longer written:
+ * dropping columns in SQLite means rebuilding the table, and an unused column is
+ * cheaper than that. What Prime reported when the AP invoice was read back after
+ * approval lives in the `prime.read_back_ap_invoice` audit row instead.
+ */
+export function setApproved(id: number): void {
+  setStage(id, "approved");
 }
 
 export function setException(id: number, reason: ExceptionReason): void {
@@ -308,15 +311,22 @@ export function setException(id: number, reason: ExceptionReason): void {
 
 /**
  * Resets an invoice for reprocessing after a human moves the message back to
- * Inbox/Retry. If Prime already has a real attachment/AP invoice for this
- * invoice (i.e. the exception happened after those writes — a persistent
- * Xero sync failure), resume from approved_pending_sync with a fresh sync
- * attempt budget rather than restarting the approve flow, which would
- * otherwise create a duplicate AP invoice in Prime. Otherwise (an exception
- * before any Prime write — no work order, cost mismatch, supplier not found,
- * unreadable) it's safe to restart the whole pipeline from 'received', since
- * the human's fix (correcting Prime/Outlook data) needs a fresh extraction
- * and match pass to take effect.
+ * Inbox/Retry.
+ *
+ * If Prime already holds a real attachment or AP invoice for this invoice, resume
+ * from `ap_created` rather than restarting the pipeline — a restart from 'received'
+ * would upload a second attachment and create a DUPLICATE AP invoice in Prime.
+ * Re-running the approve step from there is safe because it PATCHes
+ * `approvalStatus` to the value it already has.
+ *
+ * Otherwise (an exception before any Prime write — no work order, cost mismatch,
+ * supplier not found, unreadable, write blocked) it is safe to restart the whole
+ * pipeline from 'received', since the human's fix (correcting Prime or Outlook
+ * data) needs a fresh extraction and match pass to take effect.
+ *
+ * Every exception the pipeline can now produce is raised BEFORE the first Prime
+ * write, so the post-write branch is unreachable in normal operation. It stays as
+ * a guard: the cost of being wrong is a duplicate payable.
  */
 export function resetForRetry(id: number): void {
   const invoice = getInvoiceById(id);
@@ -329,13 +339,7 @@ export function resetForRetry(id: number): void {
 
   if (hasPrimeWrites) {
     getDb()
-      .prepare(
-        `UPDATE invoices SET
-           stage = 'approved_pending_sync',
-           exception_reason = NULL,
-           sync_attempt_count = 0
-         WHERE id = ?`,
-      )
+      .prepare("UPDATE invoices SET stage = 'ap_created', exception_reason = NULL WHERE id = ?")
       .run(id);
   } else {
     getDb()

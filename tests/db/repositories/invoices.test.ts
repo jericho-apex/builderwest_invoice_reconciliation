@@ -14,8 +14,7 @@ import {
   setResolvedMatch,
   setAttachmentUploaded,
   setApInvoiceCreated,
-  setApprovedPendingSync,
-  setSynced,
+  setApproved,
   setException,
   resetForRetry,
 } from "../../../src/db/repositories/invoices.js";
@@ -98,32 +97,31 @@ describe("invoices repository", () => {
       expect(invoice.exceptionReason).toBeNull();
     });
 
-    it("resumes at 'approved_pending_sync' with a fresh attempt budget when the exception happened AFTER Prime writes (persistent Xero sync failure) — never re-runs the approve flow", () => {
+    // Now unreachable in normal operation — every exception the pipeline can
+    // produce is raised before the first Prime write. It stays because the cost of
+    // being wrong is a DUPLICATE PAYABLE in Prime, and `ap_created` is the right
+    // resume point: re-running approve just PATCHes a status it already holds.
+    it("resumes at 'ap_created' when the exception happened AFTER Prime writes — never re-uploads or re-creates", () => {
       const id = createInvoice("msg-retry-postwrite");
       setExtraction(id, { totalAmountCents: 150_000, confidence: 0.9 });
       setResolvedMatch(id, { primeWorkOrderId: "wo_1", primeContactId: "contact_1" });
       setAttachmentUploaded(id, "att_1");
       setApInvoiceCreated(id, "ap_1");
-      setApprovedPendingSync(id);
-      // Simulate several failed sync-poll attempts before giving up.
-      for (let i = 0; i < 10; i++) {
-        getInvoiceById(id); // no-op reads just to mirror real usage shape
-      }
-      setException(id, "xeroSyncFailed");
+      setApproved(id);
+      setException(id, "unreadable");
 
       resetForRetry(id);
 
       const invoice = getInvoiceById(id)!;
-      expect(invoice.stage).toBe("approved_pending_sync");
+      expect(invoice.stage).toBe("ap_created");
       expect(invoice.exceptionReason).toBeNull();
-      expect(invoice.syncAttemptCount).toBe(0);
       // Prime IDs already acquired must be preserved — this is exactly what
       // prevents a duplicate AP invoice from being created in Prime.
       expect(invoice.primeApInvoiceId).toBe("ap_1");
       expect(invoice.primeAttachmentId).toBe("att_1");
     });
 
-    it("full lifecycle: matched -> attachment_uploaded -> ap_created -> approved_pending_sync -> synced", () => {
+    it("full lifecycle: matched -> attachment_uploaded -> ap_created -> approved", () => {
       const id = createInvoice("msg-full-lifecycle");
       setExtraction(id, { totalAmountCents: 150_000, confidence: 0.9 });
       setResolvedMatch(id, { primeWorkOrderId: "wo_1", primeContactId: "contact_1" });
@@ -135,14 +133,10 @@ describe("invoices repository", () => {
       setApInvoiceCreated(id, "ap_1");
       expect(getInvoiceById(id)!.stage).toBe("ap_created");
 
-      setApprovedPendingSync(id);
-      expect(getInvoiceById(id)!.stage).toBe("approved_pending_sync");
-
-      setSynced(id, { financeSystemName: "Xero", financeSystemReference: "XERO-REF-1" });
-      const final = getInvoiceById(id)!;
-      expect(final.stage).toBe("synced");
-      expect(final.isSynced).toBe(true);
-      expect(final.syncedFinanceSystemReference).toBe("XERO-REF-1");
+      // Terminal. There is no sync stage: the pipeline stops at approval and
+      // Builderwest's finance process owns the Xero push.
+      setApproved(id);
+      expect(getInvoiceById(id)!.stage).toBe("approved");
     });
   });
 
