@@ -12,7 +12,8 @@ Extract exactly these fields from the attached PDF invoice:
 - supplierAbn: the ISSUING party's Australian Business Number, digits only with all spaces removed, or null if not present
 - invoiceNumber: the invoice's own reference/number
 - invoiceDate: the invoice date, ISO 8601 (YYYY-MM-DD), or null
-- dueDate: the payment due date, ISO 8601 (YYYY-MM-DD), or null
+- dueDate: the payment due date, ISO 8601 (YYYY-MM-DD), or null. Only a date actually printed on the invoice — do NOT calculate one from payment terms, report the terms in paymentTermsDays instead
+- paymentTermsDays: the number of days after the invoice date that payment falls due, when the invoice states terms such as "Due in 30 Days", "Net 30", "30 days", "Payment terms: 14 days". The NUMBER ONLY, as a plain integer. Null if the invoice states no such terms
 - exTaxAmount: the amount excluding GST/tax, as a plain number with no currency symbol, or null
 - taxAmount: the GST/tax amount, as a plain number, or null
 - totalAmount: the total amount including tax, as a plain number, or null
@@ -26,7 +27,7 @@ Do not invent a value for a field that is genuinely absent — return null. A fi
 If the document is unreadable, scanned poorly, or any field is genuinely ambiguous, reflect that with a LOW confidence score rather than guessing at a value.
 
 Respond with ONLY a JSON object matching exactly this shape, no other text, no markdown formatting:
-{"supplierName": string|null, "supplierAbn": string|null, "invoiceNumber": string|null, "invoiceDate": string|null, "dueDate": string|null, "exTaxAmount": number|null, "taxAmount": number|null, "totalAmount": number|null, "purchaseOrderNumber": string|null, "jobNumber": string|null, "workOrderRef": string|null, "confidence": number}`;
+{"supplierName": string|null, "supplierAbn": string|null, "invoiceNumber": string|null, "invoiceDate": string|null, "dueDate": string|null, "paymentTermsDays": number|null, "exTaxAmount": number|null, "taxAmount": number|null, "totalAmount": number|null, "purchaseOrderNumber": string|null, "jobNumber": string|null, "workOrderRef": string|null, "confidence": number}`;
 
 /** PDF -> strict JSON extraction with a confidence score (PRD §4.1 step 3). */
 export async function extractInvoiceFields(

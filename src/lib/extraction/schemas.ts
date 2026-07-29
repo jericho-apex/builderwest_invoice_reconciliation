@@ -15,6 +15,11 @@ export const InvoiceExtractionSchema = z.object({
   invoiceNumber: z.string().nullable(),
   invoiceDate: z.string().nullable(),
   dueDate: z.string().nullable(),
+  // Read when the invoice states payment TERMS but leaves the due-date cell
+  // empty, as 26.pdf (Hutchy Ceilings, "Due in 30 Days") does. The model reads
+  // the number; extraction/dueDate.ts does the arithmetic, because a derived
+  // payment date has to be reproducible by whoever audits it.
+  paymentTermsDays: z.number().nullable(),
   exTaxAmount: z.number().nullable(),
   taxAmount: z.number().nullable(),
   totalAmount: z.number().nullable(),
