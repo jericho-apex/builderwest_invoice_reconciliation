@@ -7,9 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Phase 1 pilot automating trade (supplier) invoice reconciliation for Builderwest's
 claim lifecycle: polls an invoice mailbox via Microsoft Graph, extracts invoice
 fields with an AI PDF-extraction call (OpenRouter, targeting a Claude model),
-matches against Prime Ecosystem work orders, auto-approves clean matches, verifies
-Prime's existing Xero push succeeded, and routes anything uncertain to
-reason-specific Outlook folders. No dashboard, no review UI — accounts staff work
+matches against Prime Ecosystem work orders, auto-approves clean matches, and
+routes anything uncertain to reason-specific Outlook folders. **It stops at
+approved** — Builderwest's finance process pushes to Xero when it pays, which the
+pilot deliberately does not touch (see prime-api-gaps.md Q6). No dashboard, no review UI — accounts staff work
 the Outlook folders directly. Full design/rationale lives in the implementation
 plan (shared separately) / `Builderwest_Phase1_PRD.md.pdf`.
 
@@ -23,7 +24,8 @@ npm run dev                 # tsx watch src/worker/index.ts — hot reload
 npm run build                # tsc -p tsconfig.json -> dist/
 npm start                    # node dist/worker/index.js (what Render runs)
 npm test                     # vitest run
-npm run pipeline:sample      # the three client PDFs -> decision, vs a fake Prime
+npm run pipeline:sample      # the six client PDFs -> decision, vs a fake Prime
+npm run discover:prime       # READ-ONLY production Prime lookups (see below)
 npm run test:watch
 npm run lint                  # eslint .
 npm run format                # prettier --write .
@@ -32,7 +34,7 @@ npm run format                # prettier --write .
 Run a single test file: `npx vitest run tests/lib/matching/compareCost.test.ts`
 Run tests matching a name: `npx vitest run -t "some test name"`
 
-Two manual sample runners, both deliberately outside `npm test`, both loading
+Three manual runners, all deliberately outside `npm test`, all loading
 `.env.local` if present:
 
 - `npm run extract:sample` runs the real extraction prompt against the dummy
@@ -47,13 +49,29 @@ Two manual sample runners, both deliberately outside `npm test`, both loading
   `tests/fixtures/clientDummyInvoices.ts`. **No Graph call at all** — it stops at
   the decision. `-- --offline` skips the model and uses fixture extraction, which
   still exercises the real Prime client stack but proves nothing about how the
-  PDFs are read.
+  PDFs are read. It also mirrors the two derivations `driveInvoice` applies before
+  matching (`choosePurchaseOrder`, `resolveDueDate`) — skip them and two of the six
+  invoices route wrongly.
+- `npm run discover:prime` asks **production** Prime what a work order or contact
+  actually holds — GETs only, no write endpoint, no Graph. This is how a new
+  fixture's figures get established, and the reason to reach for it before
+  inventing any: it is what revealed that Prime stores contact ABNs ATO-grouped.
+  With no arguments it reports the three real test invoices; pass POs to look up
+  others.
 
-Both source their PDF list from `tests/fixtures/clientDummyInvoices.ts`, which is
-also what the "three client dummy invoices" test block asserts against — add a
-new client sample there and everything picks it up.
+The first two source their PDF list from `tests/fixtures/clientDummyInvoices.ts`,
+which is also what the "client sample invoices" test block asserts against — add a
+new client sample there and everything picks it up. Its figures must come from
+`discover:prime`, never from a guess.
 
-### What the three client dummy invoices prove
+### What the six client sample invoices prove
+
+Two generations of sample data, testing different things. **All six pass, both
+offline and against the live model** (`npm run pipeline:sample`, 2026-07-29).
+
+The original three are **synthetic** — "suppliers" are Builderwest staff
+(`contactType: User`, `@builderwest.com.au`) printing the placeholder ABN, so they
+exercise name matching and nothing else:
 
 | PDF | Issuer | PO | Total inc | Expected |
 |---|---|---|---|---|
@@ -61,21 +79,53 @@ new client sample there and everything picks it up.
 | `Dummy_Invoice_2_PO21267_INCORRECT_AMOUNT` | Tobey Chan | PO21267 | $775.50 | `Exceptions/Cost mismatch` |
 | `Dummy_Invoice_3_INCORRECT_PO` | Brittnii Woods | PO99999 | $852.50 | `Exceptions/No work order` |
 
-Two traps worth knowing before changing extraction or matching:
+The three Builderwest sent on 2026-07-29 are **real invoices from real
+subcontractors**, all against test claim `BWC-WA-6797`, and they are the first
+data that exercises ABN matching at all:
 
-- **The Attention line.** Invoices 2 and 3 print `Attention: Ryan Smith` while
-  their real issuers are Tobey Chan and Brittnii Woods. Invoice 2 produces
+| PDF | Issuer | PO | Total inc | Work order inc | Expected |
+|---|---|---|---|---|---|
+| `26.pdf` | Hutchy Ceilings | PO21343 | $1,204.50 | $1,204.50 | approve → `Processed` |
+| `369.pdf` | Beale 4 | PO21342 | $396.00 | $275.00 | `Exceptions/Cost mismatch` |
+| `invoice_300.pdf` | Rare Electrical | PO21340 | $660.00 | $660.00 | approve → `Processed` |
+
+Every figure above was read from production Prime (`npm run discover:prime`), the
+same rule that retired the invented $605.00 placeholder: **discover first, invent
+nothing.** PO21266 is `costTotal` $435.00 + `costTaxTotal` $43.50 = $478.50 inc
+GST; PO21267 is $405.00 + $40.50 = $445.50 against invoice 2's $775.50.
+
+The traps worth knowing before changing extraction or matching:
+
+- **The Attention line.** Synthetic invoices 2 and 3 print `Attention: Ryan Smith`
+  while their real issuers are Tobey Chan and Brittnii Woods. Invoice 2 produces
   `costMismatch` either way, so an outcome-only assertion passes while the
   supplier is wrong — which is why the fixtures pin the resolved contact id.
-- **The placeholder ABN.** All three print `00 000 000 000`, so all three must
-  resolve by name. Any `'abn'.eq(...)` query reaching Prime is a failure, and
-  both the test block and `pipeline:sample` assert none is sent.
-
-Both work orders' figures are now the real ones, read from production Prime on
-2026-07-28: PO21266 is `costTotal` $435.00 + `costTaxTotal` $43.50 = **$478.50**
-inc GST (invoice 1 matches to the cent), PO21267 is $405.00 + $40.50 =
-**$445.50** against invoice 2's $775.50. The invented $605.00 placeholder is
-retired.
+- **The placeholder ABN.** The synthetic three print `00 000 000 000` under two
+  different supplier names, so all three must resolve by name. Any `'abn'.eq(...)`
+  query carrying the *placeholder* is a failure — the real three legitimately do
+  query by ABN, so the assertion is specifically about the placeholder, in either
+  format.
+- **The supplier name that does not match.** The real invoices print legal names
+  (`Hutchy Ceilings Pty Ltd`, `Rare Electrical PTY LTD`) where Prime holds trading
+  names (`Hutchy Ceilings`, `Rare Electrical`). Under an exact `eq` the name lookup
+  finds nothing for any of the three, so their expected `matched_by_abn` is not a
+  nicety — it is the only route that works, and it only works because of the ABN
+  format bridge below.
+- **The PO under "WO No".** `369.pdf` labels its PO `WO No: PO21342`. The model
+  currently returns it in *both* `purchaseOrderNumber` and `workOrderRef`
+  (verified live), so `choosePurchaseOrder` just prefers the PO field — but the
+  prompt tells the model those are separate fields, so the fallback stays as
+  insurance against a model that honours that literally.
+- **The missing due date.** `26.pdf` prints `Due in 30 Days` and no date. `dueDate`
+  is required before any Prime write, so without `extraction/dueDate.ts` deriving
+  it (`2026-07-28` + 30 → `2026-08-27`) the invoice never reaches the write path.
+  The model reads `paymentTermsDays`; the arithmetic is in code, in UTC, and
+  audited as `pipeline.due_date_derived`.
+- **The two invoice numbers.** `invoice_300.pdf` heads with `Tax Invoice # 300` and
+  repeats `# 597` in its How-to-Pay block, and dates itself `29 July 2025` against
+  a `30 August 2026` due date. Take the header number; extract the date verbatim —
+  second-guessing a supplier's paperwork is not extraction's job. It is also the
+  lowest-confidence read of the six (0.85 against the 0.75 threshold).
 
 **The four-way "Ryan Smith".** Production Prime holds four contacts named
 `Ryan Smith` (one `User`, one `Client`, two `Customer`), so invoice 1's supplier
@@ -83,13 +133,8 @@ cannot resolve by name alone. The **assignment tie-break** (see `matching/`
 below) settles it: PO21266 is assigned to `8141089f…`, which is one of the four,
 so the supplier resolves as `matched_by_assignment` — verified live. Deduping the
 contacts in Prime is still worth asking for, and `ASSUME_SUPPLIER_MATCHED`
-remains as a separate escape hatch, but neither is needed for these three
-invoices any more.
-
-Note the dummy "suppliers" are all Builderwest staff (`contactType: User`,
-`@builderwest.com.au`) and every invoice prints the placeholder ABN, so this data
-still does not exercise supplier matching the way production will — ABN matching
-in particular is untested.
+remains as a separate escape hatch, but neither is needed for these invoices any
+more.
 
 ## Critical operational context
 
@@ -100,10 +145,20 @@ production environment. Two things make development safe without one:
   exactly what it *would* do (attachment upload, AP invoice creation, approval,
   `isSynced` poll) without calling any Prime write endpoint. Keep this on until
   dry-run output has been manually reviewed for a batch of synthetic invoices.
-- `PRIME_TEST_WORK_ORDER_ID` — a dedicated dummy work order in production Prime,
-  used only once dry-run is off for live write-path testing, and only with
-  written authorization and an agreed cleanup process. **Never point this at a
-  real customer work order.**
+- `PRIME_TEST_WORK_ORDER_IDS` — the comma-separated work orders live writes are
+  **fenced to**, used once dry-run is off for live write-path testing. Enforced in
+  code, not just documented: `advanceApproveFlow` refuses any other work order
+  *before* the attachment upload (so nothing is orphaned in Prime), audits
+  `pipeline.write_blocked_not_allowlisted`, and routes the invoice to
+  `Exceptions/Write blocked`. A procedural agreement was too thin here — there is
+  no sandbox and the pilot mailbox is live, so a genuine supplier invoice arriving
+  mid-test would otherwise be approved and pushed to Xero. An empty list means
+  unrestricted (the go-live setting) and `loadEnv()` warns when that is combined
+  with live writes. **Never point this at a real customer work order.**
+
+  Builderwest authorized live write testing on 2026-07-29 against test claim
+  `BWC-WA-6797`, whose dummy work orders Tobey Chan created. Cleanup in Prime and
+  Xero is theirs to do — **tell Tobey Chan and the client when a run finishes.**
 
 `ASSUME_SUPPLIER_MATCHED=true` is a **test-run-only** third switch: an invoice
 whose supplier does not resolve to exactly one Prime contact continues to the
@@ -143,7 +198,7 @@ Everything hinges on `invoices.stage` in the SQLite DB (WAL mode,
 
 ```
 received -> classified -> extracted -> matched
-  -> attachment_uploaded -> ap_created -> approved_pending_sync -> synced
+  -> attachment_uploaded -> ap_created -> approved     (approved is TERMINAL)
 or: exception:<reason>  (reason keys match EXCEPTION_FOLDERS in config/constants.ts)
 ```
 
@@ -170,7 +225,13 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   filter yet (needs real patterns from Builderwest first).
 - `orchestrator.ts` — `processMessage` (classify → create one `invoices` row
   per PDF attachment → drive) and `driveInvoice` (extract → `decideMatch` →
-  persist the outcome → approve flow or exception routing).
+  persist the outcome → approve flow or exception routing). Between extraction
+  and matching it applies the two **derivations** raw model output needs, in
+  `deriveExtraction`: `choosePurchaseOrder` (which field actually holds the PO)
+  and `resolveDueDate` (a due date the invoice stated only as terms). Both are
+  audited — `purchaseOrderSource` on `pipeline.invoice_identifiers`, and
+  `pipeline.due_date_derived` — because a matching key or a payment date that came
+  from anywhere other than the obvious field must not be silent.
 - `decide.ts` — `decideMatch`, the matching decision core: work order →
   supplier → cost, stopping at the first failing check. It computes and
   `driveInvoice` persists — no `match_results` row, no `invoices` update, and
@@ -182,9 +243,15 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   reconstruct. Not side-effect free though: the Prime finders write their own
   `audit_log` rows, so a migrated DB is still required.
 - `approve.ts` — `advanceApproveFlow`, a stage-by-stage loop: upload attachment
-  → create AP invoice → approve → poll `isSynced`. The sync poll checks once per
-  call and returns `"pending_sync"` rather than looping with a sleep — polling
-  is paced across ticks via `MAX_SYNC_POLL_ATTEMPTS`, not held in a tight loop.
+  → create AP invoice → approve → read the record back. **`approved` is terminal**;
+  the flow no longer waits for Prime's Xero push, because the push does not follow
+  approval (see `prime/apInvoices.ts` and prime-api-gaps.md Q6). The read-back is
+  observation, not a gate — one GET whose only job is to confirm `workOrderId`
+  survived the create, recorded as `prime.read_back_ap_invoice`.
+  Two gates run at the `matched` stage **before** the upload, so a refusal never
+  orphans an attachment on the Prime job: the required-fields check
+  (→ `Exceptions/Unreadable`) and the live-write fence
+  (→ `Exceptions/Write blocked`, see `PRIME_TEST_WORK_ORDER_IDS`).
 - `exception.ts` — routes to a reason-specific Outlook subfolder
   (`EXCEPTION_FOLDERS`), never auto-approves on a guess. `"unreadable"` is also
   the one trigger for the missing-data auto-reply email.
@@ -220,30 +287,97 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   `data.id`, JSON:API style; every resource carries an integer `version` for
   optimistic concurrency.
 
-  `approveApInvoice` is the one write still built on a guess, and it is known
-  wrong rather than merely unverified: production holds records with
-  `approvalStatus: "Approved"` and `isSynced: false`, so setting that field alone
-  — exactly what the code does — does **not** trigger Prime's Xero push. Every
-  synced record instead sits at `accountsPayableInvoiceStatus: "Paid"`. Whether
-  the push fires on reaching `"Approved"` or only `"Paid"` is the last real
-  blocker on the live path (prime-api-gaps.md Q6). Live, an invoice would
-  approve, poll `isSynced` `MAX_SYNC_POLL_ATTEMPTS` times, and land in
-  `Exceptions/Xero sync failed`.
+  **`approveApInvoice` will not trigger the Xero push, and that is now known
+  rather than suspected.** Read off all 15 production AP invoices on 2026-07-29:
+  the one record at `approvalStatus: "Approved"` with its lifecycle status still
+  `New` has never synced in two years — which is exactly the state this code
+  leaves an invoice in. All 12 synced records are at
+  `accountsPayableInvoiceStatus: "Paid"`, and were updated in a *batch* (identical
+  `updatedAt` and `version` across records created a day apart), i.e. by a payment
+  run rather than by anything approval did. `approvedAt` equals `createdAt` on all
+  15, so approval was never a separate transition at all.
+
+  The mechanism to change the lifecycle status is
+  `PATCH /accounts-payable-invoices/{id}/relationships/accountsPayableInvoiceStatus`
+  — a `GET` there returns **405, not 404**, which is how we know the route is real
+  and PATCH-only. It needs the resource's current `version`, so a GET first.
+  **Deliberately not implemented, and Builderwest have now chosen not to:**
+  reaching a synced state means marking the invoice `Paid`, which asserts payment
+  before payment. The decision (2026-07-29) is that **the pipeline stops at
+  approved** and Builderwest's finance process keeps pushing to Xero when it pays,
+  as it always did. So the sync poll, `MAX_SYNC_POLL_ATTEMPTS` and the
+  `Exceptions/Xero sync failed` folder are all gone rather than left to time out
+  into an exception that means nothing. **Do not "fix" this by setting `Paid`
+  without written sign-off.**
+
+  `readBackApInvoice` reads the record from `data.attributes` with flatter shapes
+  as fallbacks. Reading only the top level (as it once did) sees `undefined` for
+  every field, which would report a correctly-created AP invoice as carrying no
+  work-order link at all — the wrong answer to the one question it exists to
+  settle. A record that comes back without `workOrderId` is audited as an error;
+  it does not fail the invoice, which is already approved by then.
+
+  **`workOrderId` on AP-invoice create is effectively confirmed.** Prime's docs
+  list it as optional and nobody answered whether it is retained — but **15/15**
+  production AP invoices carry a `workOrderId` (and a `workOrderAssignedId`), so
+  the field is stored on the resource. All that is left is confirming *our* create
+  persists it, which the first live write's read-back shows. Whether a proper
+  purchase-order concept exists in the API (no `/purchase-orders` endpoint, no PO
+  field — the PO lives in the work order's `label`) is still open, but blocks
+  nothing: the `label` route is verified working.
 - `extraction/` — OpenRouter chat completion sending the PDF inline, strict
   JSON-only system prompt, `parseModelJson` validates against a Zod schema
   (`schemas.ts`). Low-confidence or unparseable extraction routes to
-  `Exceptions/Unreadable` rather than being trusted.
+  `Exceptions/Unreadable` rather than being trusted. The model is asked only to
+  *read*, never to compute: `paymentTermsDays` is the number of days a supplier's
+  terms state, and `dueDate.ts` does the date arithmetic in UTC. Asking the model
+  for a computed due date would put an unauditable payment date on a payable.
 - `matching/` — pure functions layered over the Prime clients.
   `resolveWorkOrder` keys **only** off the invoice's purchase order number and
   has deliberately no job-number fallback: a job carries many work orders (the
   client's two dummy invoices are Stage 1 and Stage 2 of job `BWC-5126`,
-  differing only by PO), so falling back to it would let an invoice be approved
-  against a sibling work order. `resolveSupplier` tries ABN then name, but only
+  differing only by PO; the three real ones are all on claim `BWC-WA-6797`), so
+  falling back to it would let an invoice be approved against a sibling work
+  order. `resolveSupplier` tries ABN then name, but only
   uses an ABN that passes `matching/abn.ts`'s checksum validation — the dummy
   invoices print the placeholder `00 000 000 000` under two different supplier
   names, so trusting it would resolve both to the same contact. **Across both,
   the rule is exactly-one-match: zero matches and several matches are equally
   unresolved, never `data[0]`** — which is why the Prime finders return arrays.
+
+  **Two format bridges, same shape and same justification.** Prime's `q=` is an
+  exact `eq`, so a lookup whose value is formatted differently from the stored one
+  misses silently. Both bridges enumerate the (at most two) canonical forms, query
+  each, and **union the results by id** before the exactly-one rule runs. Neither
+  widens what can match — an invoice that resolves to X today still has X in its
+  union, so the only reachable changes are `not_found → matched` (the fix) and
+  `→ ambiguous` (fail-safe, to a human). Neither short-circuits on the first
+  non-empty result, because that would be `data[0]` one layer up: where both forms
+  exist as different records, our own candidate ordering — not the invoice — would
+  decide which one got the money. The union dedupe is equally load-bearing in the
+  other direction: one record returned by both queries must count once, or a
+  resolvable invoice looks ambiguous.
+
+  - `matching/purchaseOrder.ts` — the **PO-prefix bridge**
+    (`PO21343` ⇄ `21343`). The client confirmed POs always start with `PO` but
+    suppliers sometimes omit it; Prime's labels are split the same way. Digits are
+    never altered — leading zeros are kept and separators *inside* the digits are
+    not stripped, since `PO 21 343 → 21343` invents a number. Anything that is not
+    *optional prefix + digits* is queried verbatim. A bridged match emits
+    `pipeline.work_order_matched_by_bridge`, so approving against a label that is
+    not literally what the invoice printed is never silent. The same module's
+    `choosePurchaseOrder` recovers a PO the model returned under `workOrderRef`
+    (369.pdf prints `WO No: PO21342`), requiring the `PO` prefix so a bare
+    work-order reference is never read as a PO, and never overriding a real
+    `purchaseOrderNumber`.
+  - `matching/abn.ts`'s `abnQueryCandidates` — the **ABN format bridge**.
+    Verified live 2026-07-29: production stores contact ABNs **ATO-grouped**
+    (`68 628 819 741`), so the digits-only query this used to send could never
+    hit. That mattered more than it sounds: the real invoices print legal names
+    (`Hutchy Ceilings Pty Ltd`) where Prime holds trading names
+    (`Hutchy Ceilings`), so the name lookup misses too and all three routed to
+    `Exceptions/Supplier not found`. The ABN is the only key that resolves a real
+    supplier.
   The one narrowing allowed is the **assignment tie-break**: where several
   contacts share the invoice's supplier name and exactly one of them is the
   contact the matched work order is assigned to (`assignedId`), that one wins,
@@ -292,6 +426,18 @@ are `vi.mock`ed. That last part means `buildEqQuery`, `primeRequest`, the
 JSON:API `Accept` header and `mapWorkOrder`'s dollars→cents conversion are
 covered by **no test** — `npm run pipeline:sample` is the only thing that
 exercises them, which is part of why it exists. Live write-path tests against
-`PRIME_TEST_WORK_ORDER_ID` are run separately and manually, requiring the
+`PRIME_TEST_WORK_ORDER_IDS` are run separately and manually, requiring the
 sign-off/cleanup steps in the implementation plan — do not wire these into the
 automated suite.
+
+**Keep the Prime stubs keyed, not blanket.** Both format bridges are invisible to
+a stub that ignores its argument: an unkeyed `findContactsByAbn` makes the
+digits-only query appear to work offline while missing in production, which is the
+exact defect `abnQueryCandidates` exists to fix. The `tests/fixtures/` contacts
+therefore store ABNs the way production does — grouped — and the sample block's
+stubs compare exactly.
+
+`tests/pipeline/approve.writeFence.test.ts` is the one suite that runs with
+`PRIME_DRY_RUN=false`, because the write fence only exists on the live path. It
+mocks Prime's write clients for that reason: with dry-run off, a fence that failed
+to hold would otherwise POST to production.

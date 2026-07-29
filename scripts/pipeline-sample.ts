@@ -66,6 +66,8 @@ import { runMigrations } from "../src/db/migrate.js";
 import { extractInvoiceFields } from "../src/lib/extraction/extractInvoice.js";
 import { dollarsToCents } from "../src/lib/money.js";
 import { decideMatch } from "../src/pipeline/decide.js";
+import { choosePurchaseOrder } from "../src/lib/matching/purchaseOrder.js";
+import { resolveDueDate } from "../src/lib/extraction/dueDate.js";
 import {
   CLIENT_DUMMY_INVOICES,
   PRIME_CONTACTS,
@@ -99,14 +101,23 @@ function describeOutcome(outcome: string, reason?: string): string {
   return reason ? `flag: ${EXCEPTION_FOLDERS[reason as keyof typeof EXCEPTION_FOLDERS]}` : outcome;
 }
 
+/** The placeholder the synthetic invoices print, which abn.ts must reject. */
+const PLACEHOLDER_ABN = "00 000 000 000";
+
 /** What --offline feeds in place of a model call: the fixture's known-correct read. */
 function fixtureExtraction(invoiceCase: ClientDummyInvoice) {
+  const { extraction } = invoiceCase;
   return {
-    supplierName: invoiceCase.extraction.supplierName,
-    // The placeholder every one of these invoices prints. abn.ts must reject it.
-    supplierAbn: "00 000 000 000",
-    purchaseOrderNumber: invoiceCase.extraction.purchaseOrderNumber,
-    totalAmount: invoiceCase.extraction.totalAmount,
+    supplierName: extraction.supplierName,
+    // The synthetic three print the placeholder; the real ones print valid ABNs,
+    // and those are the only key that resolves them (Prime holds trading names).
+    supplierAbn: extraction.supplierAbn ?? PLACEHOLDER_ABN,
+    purchaseOrderNumber: extraction.purchaseOrderNumber,
+    workOrderRef: extraction.workOrderRef ?? null,
+    invoiceDate: extraction.invoiceDate ?? null,
+    dueDate: extraction.dueDate ?? null,
+    paymentTermsDays: extraction.paymentTermsDays ?? null,
+    totalAmount: extraction.totalAmount,
     confidence: 1,
   };
 }
@@ -138,8 +149,25 @@ async function runOne(invoiceCase: ClientDummyInvoice, offline: boolean): Promis
     return row;
   }
 
+  // The same two interpretations driveInvoice applies before matching. Mirrored
+  // here rather than skipped, because they are exactly what decides two of these
+  // six: 369.pdf prints its PO under "WO No:" so the model returns it in
+  // workOrderRef, and 26.pdf prints terms instead of a due date.
+  const purchaseOrder = choosePurchaseOrder(
+    extraction.purchaseOrderNumber,
+    extraction.workOrderRef ?? null,
+  );
+  const dueDate = resolveDueDate(
+    extraction.invoiceDate ?? null,
+    extraction.dueDate ?? null,
+    extraction.paymentTermsDays ?? null,
+  );
+
   row.supplierRead = extraction.supplierName ?? "null";
-  row.poRead = extraction.purchaseOrderNumber ?? "null";
+  row.poRead =
+    purchaseOrder.source === "work_order_ref"
+      ? `${purchaseOrder.value} (from WO ref)`
+      : (purchaseOrder.value ?? "null");
   row.invoiceTotal =
     extraction.totalAmount === null ? "null" : money(dollarsToCents(extraction.totalAmount));
 
@@ -161,20 +189,30 @@ async function runOne(invoiceCase: ClientDummyInvoice, offline: boolean): Promis
         ` (the "Attention:" line on this invoice is a decoy)`,
     );
   }
-  if (extraction.purchaseOrderNumber !== invoiceCase.extraction.purchaseOrderNumber) {
-    notes.push(
-      `PO misread: got "${extraction.purchaseOrderNumber}", expected "${invoiceCase.extraction.purchaseOrderNumber}"`,
-    );
+  // Compared against the PO the pipeline ends up USING, so an invoice whose PO
+  // legitimately arrives via workOrderRef is not reported as a misread.
+  const expectedPo =
+    invoiceCase.expected.purchaseOrderUsed ?? invoiceCase.extraction.purchaseOrderNumber;
+  if (purchaseOrder.value !== expectedPo) {
+    notes.push(`PO misread: got "${purchaseOrder.value}", expected "${expectedPo}"`);
   }
   if (extraction.totalAmount !== invoiceCase.extraction.totalAmount) {
     notes.push(
       `total misread: got ${extraction.totalAmount}, expected ${invoiceCase.extraction.totalAmount}`,
     );
   }
+  // Not used by decideMatch, but this script is the only place a real model read
+  // of paymentTermsDays gets checked — and without a due date the invoice cannot
+  // be written to Prime at all.
+  if (invoiceCase.expected.dueDate && dueDate.value !== invoiceCase.expected.dueDate) {
+    notes.push(
+      `due date resolved to "${dueDate.value}" (${dueDate.source}), expected "${invoiceCase.expected.dueDate}"`,
+    );
+  }
 
   const decision = await decideMatch(
     {
-      purchaseOrderNumber: extraction.purchaseOrderNumber,
+      purchaseOrderNumber: purchaseOrder.value,
       supplierAbn: extraction.supplierAbn,
       supplierName: extraction.supplierName,
       totalAmountCents:
@@ -319,9 +357,16 @@ async function main(): Promise<void> {
       }
     }
 
-    // Every invoice prints the placeholder ABN "00 000 000 000". If any of these
-    // queries went out by ABN, all three would resolve to the same contact.
-    const abnQueries = fake.requests.filter((r) => r.q?.startsWith("'abn'.eq("));
+    // The synthetic three print the placeholder ABN "00 000 000 000" under two
+    // DIFFERENT supplier names. If it were ever used as a key they would all
+    // resolve to whichever contact carries it. The real three do query by ABN —
+    // that is the only thing that resolves them — so the check is specifically
+    // that the PLACEHOLDER never became a key, in any format.
+    const abnQueries = fake.requests.filter((r) => {
+      if (!r.q?.startsWith("'abn'.eq(")) return false;
+      const value = /^'abn'\.eq\('(.*)'\)$/.exec(r.q)?.[1] ?? "";
+      return value.replace(/\D/g, "") === "00000000000";
+    });
     console.log(`\nPrime queries sent (${fake.requests.length}):`);
     for (const request of fake.requests) {
       console.log(`  ${request.method} ${request.path}${request.q ? `  q=${request.q}` : ""}` +
