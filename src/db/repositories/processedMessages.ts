@@ -16,15 +16,26 @@ export function isEligibleForProcessing(messageId: string): boolean {
   return row === undefined || row.cleared_at !== null;
 }
 
-/** Marks a message as processed (or re-processed after a retry). */
-export function markProcessed(messageId: string): void {
+/**
+ * Marks a message as processed (or re-processed after a retry).
+ *
+ * `receivedAt` is the message's own Graph `receivedDateTime`, and it is what the
+ * poll checkpoint is built from — see getLatestProcessedTimestamp for why it
+ * cannot be a wall-clock stamp. It is optional only so a caller that genuinely
+ * does not have the summary to hand can still record the dedupe entry; when it is
+ * absent the row simply does not contribute to the checkpoint, which is the safe
+ * direction (a message gets re-listed, and dedupe skips it).
+ */
+export function markProcessed(messageId: string, receivedAt?: string): void {
   getDb()
     .prepare(
-      `INSERT INTO processed_messages (message_id, first_seen_at, cleared_at)
-       VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL)
-       ON CONFLICT (message_id) DO UPDATE SET cleared_at = NULL`,
+      `INSERT INTO processed_messages (message_id, first_seen_at, received_at, cleared_at)
+       VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, NULL)
+       ON CONFLICT (message_id) DO UPDATE SET
+         cleared_at = NULL,
+         received_at = COALESCE(excluded.received_at, processed_messages.received_at)`,
     )
-    .run(messageId);
+    .run(messageId, receivedAt ?? null);
 }
 
 /** Marks a message as cleared for retry — the next poll will treat it as eligible again. */
@@ -39,15 +50,25 @@ export function clearForRetry(messageId: string): void {
 }
 
 /**
- * The most recent first_seen_at across every processed message — used as
- * the Inbox poll checkpoint (see lib/graph/mailbox.ts) so a growing mailbox
- * is never re-listed in full. Returns undefined if nothing has been
- * processed yet (first run).
+ * The newest `receivedDateTime` we have already processed — the Inbox poll
+ * checkpoint (see lib/graph/mailbox.ts), so a growing mailbox is never re-listed in
+ * full. Returns undefined when no processed message carries one, which the poll
+ * treats as a first run and answers with its lookback window.
+ *
+ * IT MUST BE received_at, NOT first_seen_at. `first_seen_at` is wall-clock time at
+ * the moment we processed the message, and the poll feeds this value into a Graph
+ * filter as `receivedDateTime gt <checkpoint>` — two different clocks. Comparing
+ * them silently loses invoices: if one message throws and is deliberately left
+ * unmarked for retry while a later one succeeds, the checkpoint jumps to NOW and the
+ * failed message's receivedDateTime is already behind it, so it is never polled
+ * again. No invoices row, no exception folder, no supplier chasing it. That is the
+ * exact outcome the "leave it unmarked so the next poll retries it" reasoning in
+ * pipeline/orchestrator.ts exists to prevent (migration 004).
  */
 export function getLatestProcessedTimestamp(): string | undefined {
   const row = getDb()
     .prepare<[], { max_ts: string | null }>(
-      "SELECT MAX(first_seen_at) AS max_ts FROM processed_messages",
+      "SELECT MAX(received_at) AS max_ts FROM processed_messages",
     )
     .get();
   return row?.max_ts ?? undefined;

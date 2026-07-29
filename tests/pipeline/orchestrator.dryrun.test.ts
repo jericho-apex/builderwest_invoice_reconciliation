@@ -128,6 +128,7 @@ const CLEAN_EXTRACTION = {
   invoiceNumber: "TEST-INV-001",
   invoiceDate: "2026-07-22",
   dueDate: "2026-07-22",
+  paymentTermsDays: null,
   exTaxAmount: 435.0,
   taxAmount: 43.5,
   totalAmount: 478.5,
@@ -222,14 +223,14 @@ function makeMessageSummaryForReply() {
 }
 
 describe("dry-run pipeline (no Prime writes)", () => {
-  it("clean match -> approved -> synced, moved to Processed, using only fabricated dry-run Prime IDs", async () => {
+  it("clean match -> approved, moved to Processed, using only fabricated dry-run Prime IDs", async () => {
     const message = makeMessage();
 
     await processMessage(message);
 
     const invoice = getInvoiceByMessage(message.id)!;
-    expect(invoice.stage).toBe("synced");
-    expect(invoice.isSynced).toBe(true);
+    // `approved` is terminal: the pipeline no longer waits on Prime's Xero push.
+    expect(invoice.stage).toBe("approved");
     // Proof no real Prime write happened: every Prime-side ID is a dry-run stub.
     expect(invoice.primeAttachmentId).toMatch(/^dryrun-/);
     expect(invoice.primeApInvoiceId).toMatch(/^dryrun-/);
@@ -335,7 +336,7 @@ describe("dry-run pipeline (no Prime writes)", () => {
     await processMessage(message);
 
     const invoice = getInvoiceByMessage(message.id)!;
-    expect(invoice.stage).toBe("synced");
+    expect(invoice.stage).toBe("approved");
     expect(invoice.primeContactId).toBe("contact_ryan_user");
     expect(latestMatchResult(invoice.id).supplier_match_status).toBe("matched_by_assignment");
     expect(moveMessage).toHaveBeenCalledWith(message.id, PROCESSED_FOLDER, expect.anything());
@@ -469,6 +470,98 @@ describe("dry-run pipeline (no Prime writes)", () => {
     expect(getInvoiceByMessage(message.id)).toBeUndefined();
     expect(isEligibleForProcessing(message.id)).toBe(true); // still retryable
   });
+
+  // ---------------------------------------------------------------------------
+  // What the model reads is not always in the field the pipeline needs it in.
+  // Both cases below come from the client's real supplier invoices, and both
+  // would otherwise route a perfectly good invoice to a human.
+  // ---------------------------------------------------------------------------
+
+  // 369.pdf (Beale4) prints "WO No: PO21342", and the prompt tells the model
+  // workOrderRef is a SEPARATE field from purchaseOrderNumber — so the PO
+  // arrives in the wrong slot and the work-order lookup has nothing to key off.
+  it("recovers a PO the model put in workOrderRef, and records where it came from", async () => {
+    extractInvoiceFields.mockResolvedValue({
+      ...CLEAN_EXTRACTION,
+      purchaseOrderNumber: null,
+      workOrderRef: "PO21266",
+    });
+    const message = makeMessage();
+
+    await processMessage(message);
+
+    const invoice = getInvoiceByMessage(message.id)!;
+    expect(invoice.stage).toBe("approved");
+    expect(invoice.extractedPurchaseOrderNumber).toBe("PO21266");
+    // The reference column still records what the invoice printed — it is
+    // evidence of the document, not of what we matched on.
+    expect(invoice.extractedWorkOrderRef).toBe("PO21266");
+    expect(findWorkOrdersByPurchaseOrder).toHaveBeenCalledWith("PO21266", expect.anything());
+  });
+
+  it("does not read a bare-number workOrderRef as a PO", async () => {
+    extractInvoiceFields.mockResolvedValue({
+      ...CLEAN_EXTRACTION,
+      purchaseOrderNumber: null,
+      // Builderwest's POs always carry the prefix, so a bare number here is a
+      // work-order reference — a different identifier, not a mislabelled PO.
+      workOrderRef: "4471",
+    });
+    const message = makeMessage();
+
+    await processMessage(message);
+
+    const invoice = getInvoiceByMessage(message.id)!;
+    expect(invoice.stage).toBe("exception");
+    expect(invoice.exceptionReason).toBe("noWorkOrder");
+    expect(findWorkOrdersByPurchaseOrder).not.toHaveBeenCalled();
+  });
+
+  // 26.pdf (Hutchy Ceilings) prints "Due in 30 Days" and no due date. approve.ts
+  // requires one, so without this the invoice never reaches the write path.
+  it("derives a missing due date from payment terms and records that it did", async () => {
+    extractInvoiceFields.mockResolvedValue({
+      ...CLEAN_EXTRACTION,
+      invoiceDate: "2026-07-28",
+      dueDate: null,
+      paymentTermsDays: 30,
+    });
+    const message = makeMessage();
+
+    await processMessage(message);
+
+    const invoice = getInvoiceByMessage(message.id)!;
+    expect(invoice.stage).toBe("approved");
+    expect(invoice.extractedDueDate).toBe("2026-08-27");
+    expect(auditEventTypes(invoice.id)).toContain("pipeline.due_date_derived");
+  });
+
+  it("stays silent about the due date when the invoice printed one", async () => {
+    const message = makeMessage();
+
+    await processMessage(message);
+
+    const invoice = getInvoiceByMessage(message.id)!;
+    expect(invoice.extractedDueDate).toBe("2026-07-22");
+    expect(auditEventTypes(invoice.id)).not.toContain("pipeline.due_date_derived");
+  });
+
+  it("routes to Unreadable when there is no due date and no terms to derive one from", async () => {
+    extractInvoiceFields.mockResolvedValue({
+      ...CLEAN_EXTRACTION,
+      dueDate: null,
+      paymentTermsDays: null,
+    });
+    const message = makeMessage();
+
+    await processMessage(message);
+
+    const invoice = getInvoiceByMessage(message.id)!;
+    expect(invoice.stage).toBe("exception");
+    expect(invoice.exceptionReason).toBe("unreadable");
+    // The pre-flight refuses BEFORE the upload, so nothing is orphaned in Prime.
+    expect(invoice.primeAttachmentId).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -482,7 +575,7 @@ describe("dry-run pipeline (no Prime writes)", () => {
 // default stub returns the Stage 1 work order for every PO, which cannot tell
 // PO21266 from PO99999 and so cannot prove anything about invoice 3.
 // ---------------------------------------------------------------------------
-describe("the three client dummy invoices", () => {
+describe("the client sample invoices", () => {
   beforeEach(() => {
     findWorkOrdersByPurchaseOrder.mockImplementation(async (po: string) =>
       PRIME_WORK_ORDERS.filter((w) => w.purchaseOrderNumber === po).map(toPrimeWorkOrder),
@@ -490,10 +583,14 @@ describe("the three client dummy invoices", () => {
     findContactsByName.mockImplementation(async (name: string) =>
       PRIME_CONTACTS.filter((c) => c.attributes.name === name).map(toPrimeContact),
     );
-    // The placeholder ABN must never reach Prime at all — asserted below.
-    findContactsByAbn.mockImplementation(async () => {
-      throw new Error("findContactsByAbn must not be called: the placeholder ABN is invalid");
-    });
+    // Keyed on the ABN string EXACTLY as Prime stores it — grouped for the real
+    // contacts. An unkeyed stub would let the digits-only query appear to work
+    // here while missing in production, which is the defect abnQueryCandidates
+    // exists to fix. The placeholder matches no contact and, being
+    // checksum-invalid, must never be queried at all (asserted below).
+    findContactsByAbn.mockImplementation(async (abn: string) =>
+      PRIME_CONTACTS.filter((c) => c.attributes.abn === abn).map(toPrimeContact),
+    );
   });
 
   it.each(CLIENT_DUMMY_INVOICES.map((c) => [c.label, c] as const))(
@@ -514,10 +611,19 @@ describe("the three client dummy invoices", () => {
       expect(invoice.exceptionReason).toBe(expected.reason ?? null);
 
       // The PO — never the shared job number — is what the lookup keys off.
-      expect(findWorkOrdersByPurchaseOrder).toHaveBeenCalledWith(
-        invoiceCase.extraction.purchaseOrderNumber,
-        expect.anything(),
-      );
+      // purchaseOrderUsed is set where the invoice printed its PO under a label
+      // the prompt routes elsewhere (369.pdf's "WO No:"), so the value queried is
+      // the recovered one rather than what landed in purchaseOrderNumber.
+      const poQueried =
+        expected.purchaseOrderUsed ?? invoiceCase.extraction.purchaseOrderNumber;
+      expect(findWorkOrdersByPurchaseOrder).toHaveBeenCalledWith(poQueried, expect.anything());
+      expect(invoice.extractedPurchaseOrderNumber).toBe(poQueried);
+
+      // Where a due date had to be derived from payment terms, it is the derived
+      // value that gets persisted — the AP-invoice write depends on it.
+      if (expected.dueDate) {
+        expect(invoice.extractedDueDate).toBe(expected.dueDate);
+      }
 
       // Field-level, not outcome-level. Invoice 2 yields costMismatch whether
       // the model reads "Tobey Chan" (the issuer) or "Ryan Smith" (its
@@ -536,7 +642,6 @@ describe("the three client dummy invoices", () => {
       expect(matchResult.exception_reason).toBe(expected.reason ?? null);
 
       if (expected.outcome === "approve") {
-        expect(invoice.isSynced).toBe(true);
         expect(invoice.primeWorkOrderId).toBe(expected.workOrderId);
         expect(invoice.primeContactId).toBe(expected.contactId);
         expect(invoice.primeApInvoiceId).toMatch(/^dryrun-/); // no real Prime write
@@ -571,16 +676,19 @@ describe("the three client dummy invoices", () => {
     expect(matchResult.work_order_cost_cents).toBe(44_550);
   });
 
-  it("never queries Prime by the placeholder ABN for any of the three", async () => {
+  it("never queries Prime by the placeholder ABN, in any format", async () => {
     for (const invoiceCase of CLIENT_DUMMY_INVOICES) {
       extractInvoiceFields.mockResolvedValue({ ...CLEAN_EXTRACTION, ...invoiceCase.extraction });
       await processMessage(makeMessage());
     }
 
-    // All three print "00 000 000 000"; matching/abn.ts rejects it, so supplier
-    // resolution falls through to the name lookup. Had it not, all three would
-    // resolve to whichever contact carries the placeholder.
-    expect(findContactsByAbn).not.toHaveBeenCalled();
+    // The synthetic three print "00 000 000 000"; matching/abn.ts rejects it, so
+    // supplier resolution falls through to the name lookup. Had it not, all three
+    // would resolve to whichever contact carries the placeholder. Both formats are
+    // checked, since abnQueryCandidates now sends a grouped form too.
+    const abnsQueried = findContactsByAbn.mock.calls.map((call) => call[0] as string);
+    expect(abnsQueried).not.toContain("00000000000");
+    expect(abnsQueried).not.toContain("00 000 000 000");
     expect(findContactsByName).toHaveBeenCalledWith("Ryan Smith", expect.anything());
     expect(findContactsByName).toHaveBeenCalledWith("Tobey Chan", expect.anything());
     // Invoice 3 fails on its PO first, so its supplier is never looked up.

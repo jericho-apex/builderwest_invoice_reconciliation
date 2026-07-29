@@ -72,6 +72,51 @@ describe("loadEnv", () => {
     await expect(loadWith({ COST_FIELD: "cost" })).rejects.toThrow(/COST_FIELD/);
   });
 
+  describe("PRIME_TEST_WORK_ORDER_IDS", () => {
+    it("defaults to an empty list — never [\"\"], which would match nothing", async () => {
+      const env = await loadWith({});
+
+      expect(env.PRIME_TEST_WORK_ORDER_IDS).toEqual([]);
+    });
+
+    it("splits a comma-separated list, tolerating whitespace and stray commas", async () => {
+      const env = await loadWith({
+        PRIME_TEST_WORK_ORDER_IDS: " 8141089f-aaa , 9252190g-bbb ,, ",
+      });
+
+      expect(env.PRIME_TEST_WORK_ORDER_IDS).toEqual(["8141089f-aaa", "9252190g-bbb"]);
+    });
+
+    // Not a refusal — an empty allowlist is the correct production configuration,
+    // because real invoices have to be able to write. But deleting a line from
+    // .env must not be able to silently widen what can be written to production
+    // Prime, so it is at least loud.
+    it("warns when live writes are enabled with no fence at all", async () => {
+      const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      try {
+        await loadWith({ PRIME_DRY_RUN: "false", PRIME_TEST_WORK_ORDER_IDS: "" });
+
+        expect(warn.mock.calls.flat().join(" ")).toMatch(/EMPTY PRIME_TEST_WORK_ORDER_IDS/);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("stays quiet when the fence is set, and when writes are only rehearsed", async () => {
+      const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      try {
+        await loadWith({ PRIME_DRY_RUN: "false", PRIME_TEST_WORK_ORDER_IDS: "wo-test-1" });
+        await loadWith({ PRIME_DRY_RUN: "true", PRIME_TEST_WORK_ORDER_IDS: "" });
+
+        expect(warn.mock.calls.flat().join(" ")).not.toMatch(/PRIME_TEST_WORK_ORDER_IDS/);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
+
   it("lists every missing variable at once rather than failing on the first", async () => {
     process.env = { ...originalEnv, ...REQUIRED };
     delete process.env.PRIME_CLIENT_ID;

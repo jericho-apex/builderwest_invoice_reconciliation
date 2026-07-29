@@ -5,14 +5,17 @@ import type { ExceptionReason } from "../../config/constants.js";
 // happens BEFORE an invoices row is created at all — every row that exists
 // has, by construction, already passed classification as "invoice", so
 // there is no separate "classified" stage to persist.
+// `approved` is the TERMINAL SUCCESS stage: the pipeline stops at approval and
+// does not wait for Prime's Xero push — see the note above
+// EXTRACTION_CONFIDENCE_THRESHOLD in config/constants.ts for why. The earlier
+// `approved_pending_sync` and `synced` stages are gone with it.
 export const STAGES = [
   "received",
   "extracted",
   "matched",
   "attachment_uploaded",
   "ap_created",
-  "approved_pending_sync",
-  "synced",
+  "approved",
   "exception",
 ] as const;
 
@@ -22,8 +25,7 @@ export type Stage = (typeof STAGES)[number];
 const POST_WRITE_STAGES: ReadonlySet<Stage> = new Set([
   "attachment_uploaded",
   "ap_created",
-  "approved_pending_sync",
-  "synced",
+  "approved",
 ]);
 
 export interface ExtractedFields {
@@ -201,7 +203,7 @@ export function getOrCreateInvoice(messageId: string, attachmentIndex = 0): numb
  */
 export function getInFlightInvoices(): InvoiceRecord[] {
   const rows = getDb()
-    .prepare<[], InvoiceRow>("SELECT * FROM invoices WHERE stage NOT IN ('synced', 'exception')")
+    .prepare<[], InvoiceRow>("SELECT * FROM invoices WHERE stage NOT IN ('approved', 'exception')")
     .all();
   return rows.map(mapRow);
 }
@@ -286,37 +288,18 @@ export function setApInvoiceCreated(id: number, primeApInvoiceId: string): void 
   touch(id);
 }
 
-export function setApprovedPendingSync(id: number): void {
-  setStage(id, "approved_pending_sync");
-}
-
-export function recordSyncCheckAttempt(id: number): void {
-  getDb()
-    .prepare(
-      `UPDATE invoices SET
-         sync_attempt_count = sync_attempt_count + 1,
-         last_sync_check_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-       WHERE id = ?`,
-    )
-    .run(id);
-  touch(id);
-}
-
-export function setSynced(
-  id: number,
-  synced: { financeSystemName: string; financeSystemReference: string },
-): void {
-  getDb()
-    .prepare(
-      `UPDATE invoices SET
-         stage = 'synced',
-         is_synced = 1,
-         synced_finance_system_name = @financeSystemName,
-         synced_finance_system_reference = @financeSystemReference
-       WHERE id = @id`,
-    )
-    .run({ id, ...synced });
-  touch(id);
+/**
+ * Terminal success. The invoice is approved in Prime and the pipeline's work is
+ * finished — Builderwest's finance process owns the Xero push from here.
+ *
+ * The `is_synced`, `sync_attempt_count`, `last_sync_check_at` and
+ * `synced_finance_system_*` columns are left in place but are no longer written:
+ * dropping columns in SQLite means rebuilding the table, and an unused column is
+ * cheaper than that. What Prime reported when the AP invoice was read back after
+ * approval lives in the `prime.read_back_ap_invoice` audit row instead.
+ */
+export function setApproved(id: number): void {
+  setStage(id, "approved");
 }
 
 export function setException(id: number, reason: ExceptionReason): void {
@@ -328,15 +311,22 @@ export function setException(id: number, reason: ExceptionReason): void {
 
 /**
  * Resets an invoice for reprocessing after a human moves the message back to
- * Inbox/Retry. If Prime already has a real attachment/AP invoice for this
- * invoice (i.e. the exception happened after those writes — a persistent
- * Xero sync failure), resume from approved_pending_sync with a fresh sync
- * attempt budget rather than restarting the approve flow, which would
- * otherwise create a duplicate AP invoice in Prime. Otherwise (an exception
- * before any Prime write — no work order, cost mismatch, supplier not found,
- * unreadable) it's safe to restart the whole pipeline from 'received', since
- * the human's fix (correcting Prime/Outlook data) needs a fresh extraction
- * and match pass to take effect.
+ * Inbox/Retry.
+ *
+ * If Prime already holds a real attachment or AP invoice for this invoice, resume
+ * from `ap_created` rather than restarting the pipeline — a restart from 'received'
+ * would upload a second attachment and create a DUPLICATE AP invoice in Prime.
+ * Re-running the approve step from there is safe because it PATCHes
+ * `approvalStatus` to the value it already has.
+ *
+ * Otherwise (an exception before any Prime write — no work order, cost mismatch,
+ * supplier not found, unreadable, write blocked) it is safe to restart the whole
+ * pipeline from 'received', since the human's fix (correcting Prime or Outlook
+ * data) needs a fresh extraction and match pass to take effect.
+ *
+ * Every exception the pipeline can now produce is raised BEFORE the first Prime
+ * write, so the post-write branch is unreachable in normal operation. It stays as
+ * a guard: the cost of being wrong is a duplicate payable.
  */
 export function resetForRetry(id: number): void {
   const invoice = getInvoiceById(id);
@@ -349,13 +339,7 @@ export function resetForRetry(id: number): void {
 
   if (hasPrimeWrites) {
     getDb()
-      .prepare(
-        `UPDATE invoices SET
-           stage = 'approved_pending_sync',
-           exception_reason = NULL,
-           sync_attempt_count = 0
-         WHERE id = ?`,
-      )
+      .prepare("UPDATE invoices SET stage = 'ap_created', exception_reason = NULL WHERE id = ?")
       .run(id);
   } else {
     getDb()

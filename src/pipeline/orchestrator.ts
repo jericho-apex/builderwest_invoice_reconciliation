@@ -15,6 +15,11 @@ import type { GraphMessageSummary } from "../lib/graph/mailbox.js";
 import { classifyMessage } from "../lib/extraction/classifyMessage.js";
 import { extractInvoiceFields } from "../lib/extraction/extractInvoice.js";
 import type { InvoiceExtraction } from "../lib/extraction/schemas.js";
+import { resolveDueDate, type ResolvedDueDate } from "../lib/extraction/dueDate.js";
+import {
+  choosePurchaseOrder,
+  type ChosenPurchaseOrder,
+} from "../lib/matching/purchaseOrder.js";
 import { decideMatch } from "./decide.js";
 import { passesStructuralPreFilter } from "./filter.js";
 import { routeToException } from "./exception.js";
@@ -25,20 +30,56 @@ function toCents(dollars: number | null): number | undefined {
   return dollars === null ? undefined : dollarsToCents(dollars);
 }
 
-function mapExtractionToFields(extraction: InvoiceExtraction): ExtractedFields {
+interface DerivedExtraction {
+  fields: ExtractedFields;
+  purchaseOrder: ChosenPurchaseOrder;
+  dueDate: ResolvedDueDate;
+}
+
+/**
+ * The extraction as persisted, with the two interpretations the raw model output
+ * needs before anything downstream can use it:
+ *
+ * - WHICH FIELD HOLDS THE PO. 369.pdf prints its PO under the label "WO No:",
+ *   and the prompt tells the model workOrderRef is a separate field — so the PO
+ *   arrives in the wrong slot. choosePurchaseOrder recovers it, never overriding
+ *   a PO the model did read.
+ * - THE DUE DATE. 26.pdf states terms ("Due in 30 Days") and prints no date, and
+ *   approve.ts cannot write an AP invoice without one.
+ *
+ * Both are recorded in the audit trail by the caller: a matching key or a payment
+ * date that came from anywhere other than the obvious field must not be silent.
+ */
+function deriveExtraction(extraction: InvoiceExtraction): DerivedExtraction {
+  const purchaseOrder = choosePurchaseOrder(
+    extraction.purchaseOrderNumber,
+    extraction.workOrderRef,
+  );
+  const dueDate = resolveDueDate(
+    extraction.invoiceDate,
+    extraction.dueDate,
+    extraction.paymentTermsDays,
+  );
+
   return {
-    supplierName: extraction.supplierName ?? undefined,
-    supplierAbn: extraction.supplierAbn ?? undefined,
-    invoiceNumber: extraction.invoiceNumber ?? undefined,
-    invoiceDate: extraction.invoiceDate ?? undefined,
-    dueDate: extraction.dueDate ?? undefined,
-    exTaxAmountCents: toCents(extraction.exTaxAmount),
-    taxAmountCents: toCents(extraction.taxAmount),
-    totalAmountCents: toCents(extraction.totalAmount),
-    purchaseOrderNumber: extraction.purchaseOrderNumber ?? undefined,
-    jobNumber: extraction.jobNumber ?? undefined,
-    workOrderRef: extraction.workOrderRef ?? undefined,
-    confidence: extraction.confidence,
+    purchaseOrder,
+    dueDate,
+    fields: {
+      supplierName: extraction.supplierName ?? undefined,
+      supplierAbn: extraction.supplierAbn ?? undefined,
+      invoiceNumber: extraction.invoiceNumber ?? undefined,
+      invoiceDate: extraction.invoiceDate ?? undefined,
+      dueDate: dueDate.value ?? undefined,
+      exTaxAmountCents: toCents(extraction.exTaxAmount),
+      taxAmountCents: toCents(extraction.taxAmount),
+      totalAmountCents: toCents(extraction.totalAmount),
+      purchaseOrderNumber: purchaseOrder.value ?? undefined,
+      jobNumber: extraction.jobNumber ?? undefined,
+      // Kept as read, even when it is where the PO came from — this column is
+      // the record of what the invoice printed, not of what we matched on.
+      workOrderRef: extraction.workOrderRef ?? undefined,
+      confidence: extraction.confidence,
+    },
   };
 }
 
@@ -57,7 +98,7 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
     if (filterResult.reason !== "already_processed") {
       // Not an invoice candidate at all (no PDF) — mark processed so we
       // don't keep re-fetching and re-checking it on every future poll.
-      markProcessed(message.id);
+      markProcessed(message.id, message.receivedDateTime);
     }
     return;
   }
@@ -79,7 +120,7 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
   if (!classification || classification.category !== "invoice") {
     // Classifier returned a verdict (or unparseable output) — safe to mark
     // processed now so we don't re-classify this message on every future poll.
-    markProcessed(message.id);
+    markProcessed(message.id, message.receivedDateTime);
     appendAuditLog({
       ...classificationContext,
       eventType: "pipeline.not_invoice",
@@ -99,7 +140,7 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
   const invoiceIds = filterResult.pdfAttachments.map((_, attachmentIndex) =>
     getOrCreateInvoice(message.id, attachmentIndex),
   );
-  markProcessed(message.id);
+  markProcessed(message.id, message.receivedDateTime);
 
   for (const invoiceId of invoiceIds) {
     await driveInvoice(invoiceId);
@@ -115,7 +156,7 @@ export async function processMessage(message: GraphMessageSummary): Promise<void
  */
 export async function driveInvoice(invoiceId: number): Promise<void> {
   const invoice = getInvoiceById(invoiceId);
-  if (!invoice || invoice.stage === "synced" || invoice.stage === "exception") {
+  if (!invoice || invoice.stage === "approved" || invoice.stage === "exception") {
     return; // Terminal — nothing to do.
   }
 
@@ -138,13 +179,14 @@ export async function driveInvoice(invoiceId: number): Promise<void> {
           // Still record what we got, even though it's below threshold —
           // useful for a human reviewing Exceptions/Unreadable, and for
           // later confidence-threshold calibration.
-          setExtraction(invoiceId, mapExtractionToFields(extraction));
+          setExtraction(invoiceId, deriveExtraction(extraction).fields);
         }
         await routeToException(invoiceId, invoice.messageId, "unreadable", context);
         return;
       }
 
-      setExtraction(invoiceId, mapExtractionToFields(extraction));
+      const derived = deriveExtraction(extraction);
+      setExtraction(invoiceId, derived.fields);
 
       // The identifiers, recorded explicitly rather than left implicit in the
       // extraction blob: the PO is the sole matching key, and the job number
@@ -157,8 +199,26 @@ export async function driveInvoice(invoiceId: number): Promise<void> {
           purchaseOrderNumber: extraction.purchaseOrderNumber,
           jobNumber: extraction.jobNumber,
           workOrderRef: extraction.workOrderRef,
+          // Where the PO that matching will actually use came from. "work_order_ref"
+          // means the model put it in the wrong field and we recovered it.
+          purchaseOrderSource: derived.purchaseOrder.source,
+          purchaseOrderUsed: derived.purchaseOrder.value,
         },
       });
+
+      // A payment date the invoice never printed is on the money path, so it goes
+      // on the record rather than being inferred silently.
+      if (derived.dueDate.source === "payment_terms") {
+        appendAuditLog({
+          ...context,
+          eventType: "pipeline.due_date_derived",
+          detail: {
+            invoiceDate: extraction.invoiceDate,
+            paymentTermsDays: extraction.paymentTermsDays,
+            dueDate: derived.dueDate.value,
+          },
+        });
+      }
     }
 
     const afterExtraction = getInvoiceById(invoiceId)!;

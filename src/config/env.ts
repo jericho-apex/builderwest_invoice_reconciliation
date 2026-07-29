@@ -1,8 +1,27 @@
 import { z } from "zod";
+// Circular by design and safe: logger reads LOG_LEVEL through loadEnv, but only
+// inside its function bodies, so nothing here runs at module-evaluation time.
+import { logger } from "../log/logger.js";
 
 const boolFromString = z
   .enum(["true", "false"])
   .transform((value) => value === "true");
+
+/**
+ * Comma-separated list -> string[]. Blank entries and surrounding whitespace are
+ * dropped, so a trailing comma or a line broken across an .env file is harmless.
+ * An unset or empty variable yields an empty array, never `[""]` — which would
+ * otherwise read as a one-entry allowlist that matches nothing.
+ */
+const csvList = z
+  .string()
+  .optional()
+  .transform((value) =>
+    (value ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry !== ""),
+  );
 
 const envSchema = z.object({
   // Prime Ecosystem API — production only, no sandbox tier for this pilot.
@@ -12,7 +31,23 @@ const envSchema = z.object({
   PRIME_USERNAME: z.string().min(1),
   PRIME_PASSWORD: z.string().min(1),
   PRIME_DRY_RUN: boolFromString.default("true"),
-  PRIME_TEST_WORK_ORDER_ID: z.string().optional(),
+
+  // The work orders live writes are FENCED TO. Comma-separated Prime work-order
+  // ids; empty means unrestricted.
+  //
+  // Builderwest authorized live write testing on 2026-07-29 against test claim
+  // BWC-WA-6797, whose dummy work orders Tobey Chan created — and cleanup in
+  // Prime and Xero is theirs to do once told the run is finished. Since there is
+  // no Prime sandbox, PRIME_DRY_RUN=false writes to production, against a live
+  // mailbox that could receive a genuine supplier invoice mid-test. So this is a
+  // code-enforced fence, not a note in a runbook: approve.ts refuses to write for
+  // any work order outside the list and routes the invoice to
+  // Exceptions/Write blocked instead.
+  //
+  // Empty deliberately means unrestricted rather than "block everything",
+  // because at go-live real invoices must be able to write. loadEnv() logs a
+  // warning when that combination is live, so losing the fence cannot be silent.
+  PRIME_TEST_WORK_ORDER_IDS: csvList,
 
   // Which queryable work-order field holds the purchase order number printed
   // on a supplier invoice. Prime's v2 docs list no `purchaseOrderNumber` field
@@ -24,21 +59,22 @@ const envSchema = z.object({
   // 500, not an empty result set, so a wrong name here throws (after retries)
   // rather than routing to Exceptions/No work order.
   //
-  // STILL FOR THE CLIENT: label format is inconsistent in production — the
-  // dummy invoices' work orders are labelled "PO21266", but most rows are
-  // labelled with a bare number ("17651"). An invoice printing "PO17651"
-  // would not match a work order labelled "17651" under an exact-match query.
+  // ANSWERED by the client 2026-07-29: POs always start with "PO", but suppliers
+  // sometimes omit the prefix when printing one, and either should match. Prime's
+  // labels are split the same way (test work orders "PO21343", most production
+  // rows a bare "17651"). matching/purchaseOrder.ts bridges it by querying both
+  // canonical forms and unioning; nothing here needs to change.
   PRIME_WORK_ORDER_PO_FIELD: z.string().min(1).default("label"),
 
   // Which Prime attachment type an uploaded invoice PDF is filed under. Tenant
   // data, not a business rule, hence env — the IDs differ per Prime tenant.
   //
-  // FOR BUILDERWEST TO CONFIRM. Read from production 2026-07-28: the AP invoices
-  // that already exist carry attachments of type 2903b377-… , labelled
-  // "Invoices" — but that type is NOT returned by /attachment-types, so it looks
-  // retired. The default below is the active equivalent, "Subcontractor
-  // Invoices". Both work; the question is which one Builderwest wants automated
-  // uploads to appear under.
+  // CONFIRMED by the client 2026-07-29: "any trade invoice is submitted under
+  // subcontractor invoices". Read from production 2026-07-28, the AP invoices that
+  // already exist carry attachments of type 2903b377-… labelled "Invoices", but
+  // that type is NOT returned by /attachment-types and so looks retired. The
+  // default below is the active equivalent, "Subcontractor Invoices" — i.e. the
+  // client's answer confirms what this already did, and no change was needed.
   PRIME_ATTACHMENT_TYPE_ID: z.string().min(1).default("7f38c5c1-d5dd-4981-8868-e79f4f3323e8"),
 
   COST_TOLERANCE_MODE: z.enum(["exact", "dollar", "percentage"]).default("exact"),
@@ -124,6 +160,23 @@ export function loadEnv(): Env {
     );
   }
 
+  // Cached BEFORE the warning below, not after: logger.warn reads LOG_LEVEL via
+  // loadEnv, so warning first would re-enter this function, fail the cache check,
+  // re-parse, and warn again — forever.
   cachedEnv = parsed.data;
+
+  // Not a refusal: an empty allowlist is the CORRECT production configuration,
+  // since real invoices have to be able to write. But during the pilot it is
+  // almost certainly a mistake — someone cleared the fence and left live writes
+  // on — and deleting a line from .env should not be able to silently widen what
+  // can be written to production Prime.
+  if (!cachedEnv.PRIME_DRY_RUN && cachedEnv.PRIME_TEST_WORK_ORDER_IDS.length === 0) {
+    logger.warn(
+      "PRIME_DRY_RUN=false with an EMPTY PRIME_TEST_WORK_ORDER_IDS — live Prime " +
+        "writes are enabled for EVERY matched work order, not just test ones. " +
+        "This is correct only at go-live; during pilot testing set the allowlist.",
+    );
+  }
+
   return cachedEnv;
 }

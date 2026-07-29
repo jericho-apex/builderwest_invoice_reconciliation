@@ -25,7 +25,9 @@ vi.mock("../../../src/config/env.js", () => ({
 }));
 
 const { uploadAttachment } = await import("../../../src/lib/prime/attachments.js");
-const { createApInvoice } = await import("../../../src/lib/prime/apInvoices.js");
+const { createApInvoice, readBackApInvoice } = await import(
+  "../../../src/lib/prime/apInvoices.js"
+);
 
 const context = { invoiceId: 1, messageId: "msg-1" };
 
@@ -176,5 +178,133 @@ describe("createApInvoice", () => {
 
     const [audit] = appendAuditLog.mock.calls[0] as [{ detail: { body: Record<string, unknown> } }];
     expect(audit.detail.body).toMatchObject({ amount: 478.5, jobId: "job-abc" });
+  });
+});
+
+describe("readBackApInvoice", () => {
+  function auditDetail(): Record<string, unknown> {
+    const [audit] = appendAuditLog.mock.calls[0] as [{ detail: Record<string, unknown> }];
+    return audit.detail;
+  }
+
+  // The shape that matters: Prime v2 is JSON:API and every other resource in this
+  // client reads its fields from data.attributes. Reading only the top level saw
+  // `undefined` for everything — which would report a correctly-created AP invoice
+  // as carrying no work-order link at all, i.e. exactly the wrong answer to the one
+  // question this read-back exists to settle.
+  it("reads the record out of the JSON:API attributes envelope", async () => {
+    primeRequest.mockResolvedValue({
+      data: {
+        id: "ap-1",
+        attributes: {
+          approvalStatus: "Approved",
+          accountsPayableInvoiceStatus: "New",
+          workOrderId: "wo-abc",
+          jobId: "job-abc",
+          isSynced: false,
+        },
+      },
+    });
+
+    await expect(readBackApInvoice("ap-1", context)).resolves.toEqual({
+      approvalStatus: "Approved",
+      accountsPayableInvoiceStatus: "New",
+      workOrderId: "wo-abc",
+      jobId: "job-abc",
+      isSynced: false,
+      syncedFinanceSystemName: undefined,
+      syncedFinanceSystemReference: undefined,
+    });
+  });
+
+  it("still reads a flat response, so either shape works", async () => {
+    primeRequest.mockResolvedValue({ approvalStatus: "Approved", workOrderId: "wo-abc" });
+
+    await expect(readBackApInvoice("ap-1", context)).resolves.toMatchObject({
+      approvalStatus: "Approved",
+      workOrderId: "wo-abc",
+    });
+  });
+
+  it("reads fields sitting directly on data, without attributes", async () => {
+    primeRequest.mockResolvedValue({ data: { id: "ap-1", workOrderId: "wo-abc" } });
+
+    await expect(readBackApInvoice("ap-1", context)).resolves.toMatchObject({
+      workOrderId: "wo-abc",
+    });
+  });
+
+  // The work-order link is the whole point of the project, so a record that came
+  // back without one is flagged as an error even though the invoice is already
+  // approved by this point and nothing is retried.
+  it("flags a missing work-order link as an error in the audit trail", async () => {
+    primeRequest.mockResolvedValue({ data: { id: "ap-1", attributes: { approvalStatus: "Approved" } } });
+
+    await readBackApInvoice("ap-1", context);
+
+    const [audit] = appendAuditLog.mock.calls[0] as [{ eventType: string; isError: boolean }];
+    expect(audit.eventType).toBe("prime.read_back_ap_invoice");
+    expect(audit.isError).toBe(true);
+  });
+
+  it("does not flag a record that came back with its work-order link", async () => {
+    primeRequest.mockResolvedValue({ data: { id: "ap-1", attributes: { workOrderId: "wo-abc" } } });
+
+    await readBackApInvoice("ap-1", context);
+
+    const [audit] = appendAuditLog.mock.calls[0] as [{ isError: boolean }];
+    expect(audit.isError).toBe(false);
+  });
+
+  // Never "probably synced". The pipeline does not act on this either way — it
+  // stops at approved — but the audit trail should not claim a sync that Prime did
+  // not report.
+  it("treats a missing or non-boolean isSynced as not synced", async () => {
+    for (const response of [{}, { data: { id: "ap-1" } }, { isSynced: "true" }, { isSynced: 1 }]) {
+      primeRequest.mockResolvedValue(response);
+
+      await expect(readBackApInvoice("ap-1", context)).resolves.toMatchObject({
+        isSynced: false,
+      });
+    }
+  });
+
+  // Both status fields are recorded because they are the evidence for the Xero-push
+  // question (prime-api-gaps.md Q6) if it is ever revisited.
+  it("audits the whole record, including both of Prime's status fields", async () => {
+    primeRequest.mockResolvedValue({
+      data: {
+        id: "ap-1",
+        attributes: {
+          isSynced: false,
+          approvalStatus: "Approved",
+          accountsPayableInvoiceStatus: "New",
+          workOrderId: "wo-abc",
+        },
+      },
+    });
+
+    await readBackApInvoice("ap-1", context);
+
+    expect(auditDetail()).toMatchObject({
+      apInvoiceId: "ap-1",
+      record: {
+        approvalStatus: "Approved",
+        accountsPayableInvoiceStatus: "New",
+        workOrderId: "wo-abc",
+        isSynced: false,
+      },
+    });
+  });
+
+  // Reports NOT-synced under dry-run, deliberately: a fabricated `isSynced: true`
+  // was only ever needed to get the old sync poll to terminate, and now it would
+  // just put a claim in the audit trail that no Prime record supports.
+  it("fabricates an unsynced record for a dry-run id without calling Prime", async () => {
+    await expect(readBackApInvoice("dryrun-ap-invoice-abc", context)).resolves.toMatchObject({
+      approvalStatus: "Approved",
+      isSynced: false,
+    });
+    expect(primeRequest).not.toHaveBeenCalled();
   });
 });

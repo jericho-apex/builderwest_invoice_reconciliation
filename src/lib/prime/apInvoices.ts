@@ -22,7 +22,22 @@ export interface CreateApInvoiceInput {
   dueDate: string;
 }
 
-export interface ApInvoiceSyncStatus {
+/** What Prime holds for an AP invoice after we approved it. Observation, not a gate. */
+export interface ApInvoiceReadBack {
+  approvalStatus?: string;
+  accountsPayableInvoiceStatus?: string;
+  /**
+   * The link this whole project exists to create. Prime's docs list `workOrderId`
+   * as OPTIONAL on create and never confirmed it is retained; all 15 production AP
+   * invoices carry one, and this is what proves OUR create persisted it
+   * (prime-api-gaps.md Q9).
+   */
+  workOrderId?: string;
+  jobId?: string;
+  /**
+   * Recorded, never acted on. The pipeline stops at approved and does not wait for
+   * Prime's Xero push, so this is expected to be false at read-back time.
+   */
   isSynced: boolean;
   syncedFinanceSystemName?: string;
   syncedFinanceSystemReference?: string;
@@ -33,10 +48,17 @@ interface PrimeApInvoiceApiResponse {
   data: { id: string };
 }
 
-interface PrimeApInvoiceSyncApiResponse {
-  isSynced: boolean;
-  syncedFinanceSystemName?: string;
-  syncedFinanceSystemReference?: string;
+type ApInvoiceFields = Omit<ApInvoiceReadBack, "isSynced"> & { isSynced?: boolean };
+
+/**
+ * Prime v2 is JSON:API — everything else in this client reads resource fields
+ * from `data.attributes` (see workOrders.ts's mapWorkOrder). This response is
+ * typed to accept EITHER shape because reading the wrong one is silently
+ * expensive: every field would come back undefined, and the read-back would
+ * report a correctly-created AP invoice as carrying no work-order link.
+ */
+interface PrimeApInvoiceApiRecord extends ApInvoiceFields {
+  data?: ({ id?: string; attributes?: ApInvoiceFields } & ApInvoiceFields) | null;
 }
 
 function fromCents(cents: number): number {
@@ -111,11 +133,22 @@ export async function createApInvoice(
  * existing hook to push the invoice to Xero (PRD §4.1/§4.3 — Apex never
  * calls Xero directly).
  *
- * ASSUMPTION FLAGGED FOR VERIFICATION: the PATCH field name below
- * (`approvalStatus`) is a placeholder — the PRD documents that
- * `accountsPayableInvoiceStatus` and `approvalStatus` both exist on this
- * object but doesn't specify which one "Approved" is written to. Confirm
- * against Prime's API reference before this is used against real data.
+ * THIS IS THE PIPELINE'S LAST PRIME WRITE, and it deliberately does not chase the
+ * Xero push any further. Decided with Builderwest 2026-07-29.
+ *
+ * Setting `approvalStatus` does NOT trigger Prime's push to Xero — read off all 15
+ * production AP invoices: one has sat at `approvalStatus: "Approved"` with its
+ * lifecycle status still `New`, unsynced, since December 2023, which is exactly the
+ * state this call leaves an invoice in. The 12 that did sync are all
+ * `accountsPayableInvoiceStatus: "Paid"` and were updated in a batch, i.e. by a
+ * payment run.
+ *
+ * Reaching a synced state would mean PATCHing
+ * `/accounts-payable-invoices/{id}/relationships/accountsPayableInvoiceStatus` to
+ * "Paid" (that route exists — a GET returns 405, not 404 — and needs the record's
+ * `version`). That asserts payment before payment has happened, so it is NOT done
+ * here and must not be added without written sign-off from Builderwest. Their
+ * finance process pushes to Xero when it pays, as it always did.
  */
 export async function approveApInvoice(apInvoiceId: string, context: AuditContext): Promise<void> {
   if (isDryRunId(apInvoiceId)) {
@@ -142,41 +175,71 @@ export async function approveApInvoice(apInvoiceId: string, context: AuditContex
 }
 
 /**
- * Polls the AP invoice's isSynced / syncedFinanceSystemName /
- * syncedFinanceSystemReference fields (PRD §4.3) — how the pipeline detects
- * that Prime's own Xero push succeeded, without calling Xero directly.
+ * Reads the AP invoice back after approving it. OBSERVATION, NOT A GATE — the
+ * pipeline finishes whatever this returns, and only records it.
+ *
+ * It is worth one GET because it is the only confirmation that the write actually
+ * landed the way we think: whether `workOrderId` survived the create (the link this
+ * project exists to make, and the last unanswered Prime question — Q9), and what
+ * Prime's two status fields hold, which is the evidence for the Xero-push question
+ * if it is ever revisited. `isSynced` is expected to be false here and is not
+ * treated as a failure.
  */
-export async function getApInvoiceSyncStatus(
+export async function readBackApInvoice(
   apInvoiceId: string,
   context: AuditContext,
-): Promise<ApInvoiceSyncStatus> {
+): Promise<ApInvoiceReadBack> {
   if (isDryRunId(apInvoiceId)) {
-    const status: ApInvoiceSyncStatus = {
-      isSynced: true,
-      syncedFinanceSystemName: "Xero (dry-run)",
-      syncedFinanceSystemReference: `dryrun-xero-ref-${randomUUID()}`,
+    const record: ApInvoiceReadBack = {
+      approvalStatus: "Approved",
+      accountsPayableInvoiceStatus: "New (dry-run)",
+      isSynced: false,
     };
-    logger.info("[dry-run] simulated isSynced poll", { apInvoiceId, status });
+    logger.info("[dry-run] would read the AP invoice back", { apInvoiceId, record });
     appendAuditLog({
       ...context,
-      eventType: "prime.poll_sync.dry_run",
-      detail: { apInvoiceId, status },
+      eventType: "prime.read_back_ap_invoice.dry_run",
+      detail: { apInvoiceId, record },
     });
-    return status;
+    return record;
   }
 
-  const response = await primeRequest<PrimeApInvoiceSyncApiResponse>({
+  const response = await primeRequest<PrimeApInvoiceApiRecord>({
     method: "GET",
     path: `/accounts-payable-invoices/${apInvoiceId}`,
   });
 
-  const status: ApInvoiceSyncStatus = {
-    isSynced: response.isSynced,
-    syncedFinanceSystemName: response.syncedFinanceSystemName,
-    syncedFinanceSystemReference: response.syncedFinanceSystemReference,
+  // JSON:API `data.attributes` first, since that is where every other resource
+  // in this client carries its fields, then the flatter shapes. Reading only the
+  // top level (as this once did) sees `undefined` for everything and would report a
+  // correctly-created AP invoice as carrying no work-order link at all.
+  const fields: ApInvoiceFields = {
+    ...response,
+    ...(response.data ?? {}),
+    ...(response.data?.attributes ?? {}),
   };
 
-  appendAuditLog({ ...context, eventType: "prime.poll_sync", detail: { apInvoiceId, status } });
+  const status: ApInvoiceReadBack = {
+    approvalStatus: fields.approvalStatus,
+    accountsPayableInvoiceStatus: fields.accountsPayableInvoiceStatus,
+    workOrderId: fields.workOrderId,
+    jobId: fields.jobId,
+    isSynced: fields.isSynced === true,
+    syncedFinanceSystemName: fields.syncedFinanceSystemName,
+    syncedFinanceSystemReference: fields.syncedFinanceSystemReference,
+  };
+
+  // The whole record, because this row is the only durable evidence of what Prime
+  // actually stored: the work-order link (Q9) and both status fields, which is what
+  // any future conversation about the Xero push will be argued from.
+  appendAuditLog({
+    ...context,
+    eventType: "prime.read_back_ap_invoice",
+    detail: { apInvoiceId, record: status },
+    // A missing work-order link is not worth failing the invoice over — it is
+    // already approved in Prime by this point — but it IS wrong, so flag it.
+    isError: status.workOrderId === undefined,
+  });
 
   return status;
 }

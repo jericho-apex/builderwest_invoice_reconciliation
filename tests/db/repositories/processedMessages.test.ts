@@ -42,9 +42,45 @@ describe("processedMessages repository", () => {
   });
 
   it("markProcessed makes the message ineligible for reprocessing, and sets the checkpoint", () => {
-    markProcessed("msg-processed-1");
+    markProcessed("msg-processed-1", "2026-07-29T10:16:45Z");
     expect(isEligibleForProcessing("msg-processed-1")).toBe(false);
-    expect(getLatestProcessedTimestamp()).not.toBeUndefined();
+    // The checkpoint is the MESSAGE's receivedDateTime, verbatim — not the wall
+    // clock. It is fed straight into a Graph `receivedDateTime gt ...` filter, so
+    // the two have to be the same clock. See getLatestProcessedTimestamp.
+    expect(getLatestProcessedTimestamp()).toBe("2026-07-29T10:16:45Z");
+  });
+
+  it("keeps the newest receivedDateTime as the checkpoint, whatever order messages arrive in", () => {
+    markProcessed("msg-order-older", "2026-07-29T09:00:00Z");
+    markProcessed("msg-order-newer", "2026-07-29T11:00:00Z");
+    markProcessed("msg-order-older-again", "2026-07-29T08:00:00Z");
+
+    expect(getLatestProcessedTimestamp()).toBe("2026-07-29T11:00:00Z");
+  });
+
+  // The defect migration 004 fixes. A message processed WITHOUT its received time
+  // must not push the checkpoint forward at all — the old code stamped 'now', which
+  // is a different clock from the one Graph filters on, so any un-marked message
+  // older than that (one deliberately left for retry, say) fell behind the
+  // checkpoint and was never polled again. A silently lost supplier invoice.
+  it("a message recorded with no received time does not move the checkpoint", () => {
+    markProcessed("msg-no-received-time");
+
+    expect(isEligibleForProcessing("msg-no-received-time")).toBe(false);
+    expect(getLatestProcessedTimestamp()).toBe("2026-07-29T11:00:00Z");
+  });
+
+  it("fills in a received time later rather than losing one already recorded", () => {
+    markProcessed("msg-late-time");
+    expect(getLatestProcessedTimestamp()).toBe("2026-07-29T11:00:00Z");
+
+    // A retry supplies it.
+    markProcessed("msg-late-time", "2026-07-29T12:00:00Z");
+    expect(getLatestProcessedTimestamp()).toBe("2026-07-29T12:00:00Z");
+
+    // And a later call without one must not wipe it back out.
+    markProcessed("msg-late-time");
+    expect(getLatestProcessedTimestamp()).toBe("2026-07-29T12:00:00Z");
   });
 
   it("clearForRetry makes a previously-processed message eligible again", () => {
