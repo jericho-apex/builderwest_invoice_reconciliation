@@ -2,7 +2,7 @@ import { findContactsByAbn, findContactsByName } from "../prime/contacts.js";
 import type { PrimeContact } from "../prime/contacts.js";
 import type { AuditContext } from "../prime/workOrders.js";
 import { loadEnv } from "../../config/env.js";
-import { normalizeAbn, isValidAbn } from "./abn.js";
+import { normalizeAbn, isValidAbn, abnQueryCandidates } from "./abn.js";
 
 export type SupplierResolution =
   | { status: "matched_by_abn"; contact: PrimeContact }
@@ -69,7 +69,19 @@ export async function resolveSupplier(
   const abn = input.abn ? normalizeAbn(input.abn) : "";
 
   if (isValidAbn(abn)) {
-    const byAbn = soleMatch(await findContactsByAbn(abn, context));
+    // Both stored formats, unioned by contact id. Production holds the ABN
+    // ATO-grouped, so querying only the digits found nothing — see
+    // abnQueryCandidates. Deduping matters for the same reason it does in
+    // resolveWorkOrder: one contact returned by both queries must count once, or
+    // a resolvable supplier would look ambiguous.
+    const byId = new Map<string, PrimeContact>();
+    for (const candidate of abnQueryCandidates(abn)) {
+      for (const contact of await findContactsByAbn(candidate, context)) {
+        byId.set(contact.id, contact);
+      }
+    }
+
+    const byAbn = soleMatch([...byId.values()]);
     if (byAbn) {
       return { status: "matched_by_abn", contact: byAbn };
     }

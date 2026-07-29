@@ -242,4 +242,97 @@ describe("resolveSupplier", () => {
       expect(result).not.toHaveProperty("contact");
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Verified live 2026-07-29: production Prime stores contact ABNs in the ATO's
+  // grouped format. Prime's `q=` is an exact `eq`, so querying only the digits
+  // (which is all this did) could never hit, and every real supplier fell through
+  // to a name lookup that misses too — invoices print legal names ("Hutchy
+  // Ceilings Pty Ltd") where Prime holds trading names ("Hutchy Ceilings"). All
+  // three of the client's real supplier invoices routed to Exceptions/Supplier
+  // not found for that reason alone.
+  // ---------------------------------------------------------------------------
+  describe("the ABN format bridge", () => {
+    const hutchy = { id: "contact_hutchy", name: "Hutchy Ceilings", abn: "68 628 819 741" };
+
+    it("finds a contact whose ABN Prime stores grouped", async () => {
+      findContactsByAbn.mockImplementation((abn: string) =>
+        Promise.resolve(abn === "68 628 819 741" ? [hutchy] : []),
+      );
+
+      const result = await resolveSupplier(
+        { abn: "68 628 819 741", name: "Hutchy Ceilings Pty Ltd" },
+        context,
+      );
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: hutchy });
+      // The name never had to be right — which is the point, since it isn't.
+      expect(findContactsByName).not.toHaveBeenCalled();
+    });
+
+    it("still finds one stored as bare digits", async () => {
+      findContactsByAbn.mockImplementation((abn: string) =>
+        Promise.resolve(abn === "68628819741" ? [hutchy] : []),
+      );
+
+      const result = await resolveSupplier({ abn: "68628819741", name: null }, context);
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: hutchy });
+    });
+
+    // Beale4's invoice prints "3910 8785 824" — valid digits, non-standard
+    // grouping. Re-grouping to the ATO format is what reaches the stored value.
+    it("recovers the stored form from a non-standard printed grouping", async () => {
+      const beale = { id: "contact_beale", name: "Beale 4 Maintenance" };
+      findContactsByAbn.mockImplementation((abn: string) =>
+        Promise.resolve(abn === "39 108 785 824" ? [beale] : []),
+      );
+
+      const result = await resolveSupplier({ abn: "3910 8785 824", name: "Beale4" }, context);
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: beale });
+    });
+
+    // Same reasoning as resolveWorkOrder's union: one contact returned by both
+    // queries must count once, or a resolvable supplier would look ambiguous and
+    // be sent to a human for no reason.
+    it("counts a contact returned by both formats once", async () => {
+      findContactsByAbn.mockResolvedValue([hutchy]);
+
+      const result = await resolveSupplier({ abn: "68 628 819 741", name: null }, context);
+
+      expect(result).toEqual({ status: "matched_by_abn", contact: hutchy });
+      expect(findContactsByAbn).toHaveBeenCalledTimes(2);
+    });
+
+    it("queries the grouped form first, so the common case costs one call", async () => {
+      findContactsByAbn.mockResolvedValue([]);
+
+      await resolveSupplier({ abn: "68628819741", name: null }, context);
+
+      expect(findContactsByAbn).toHaveBeenNthCalledWith(1, "68 628 819 741", context);
+      expect(findContactsByAbn).toHaveBeenNthCalledWith(2, "68628819741", context);
+    });
+
+    // Bridging a format must not become bridging to a different business: two
+    // DIFFERENT contacts carrying the same ABN is a data problem in Prime, and
+    // the exactly-one rule still sends it to a human.
+    it("does not resolve when the two formats name different contacts", async () => {
+      findContactsByAbn.mockImplementation((abn: string) =>
+        Promise.resolve(abn === "68 628 819 741" ? [hutchy] : [tobey]),
+      );
+
+      const result = await resolveSupplier({ abn: "68628819741", name: null }, context);
+
+      expect(result).toEqual({ status: "not_found" });
+    });
+
+    it("still never queries at all on a checksum-invalid ABN", async () => {
+      findContactsByName.mockResolvedValue([]);
+
+      await resolveSupplier({ abn: "00 000 000 000", name: "Anyone" }, context);
+
+      expect(findContactsByAbn).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -46,3 +46,36 @@ export function isValidAbn(digits: string): boolean {
 
   return weighted % 89 === 0;
 }
+
+/**
+ * The ATO's display grouping, 2-3-3-3: "68628819741" -> "68 628 819 741".
+ * Expects already-validated digits.
+ */
+export function formatAbn(digits: string): string {
+  return [digits.slice(0, 2), digits.slice(2, 5), digits.slice(5, 8), digits.slice(8, 11)].join(" ");
+}
+
+/**
+ * The forms of an ABN worth asking Prime about, most canonical first.
+ *
+ * VERIFIED LIVE 2026-07-29: Builderwest's production contacts store the ABN
+ * FORMATTED, in the ATO's 2-3-3-3 grouping — `'abn'.eq('68 628 819 741')`
+ * returns the Hutchy Ceilings contact while `'abn'.eq('68628819741')` returns
+ * nothing. Since Prime's `q=` is an exact `eq`, sending only the digits (as
+ * resolveSupplier did) means the ABN lookup can never hit, and every real
+ * supplier falls through to a name lookup that misses too — invoices print legal
+ * names ("Hutchy Ceilings Pty Ltd") where Prime holds trading names ("Hutchy
+ * Ceilings"). All three of the client's real supplier invoices routed to
+ * Exceptions/Supplier not found for that reason alone.
+ *
+ * Both forms are queried and the results unioned, exactly as the PO-prefix bridge
+ * does in purchaseOrder.ts, and for the same reason: it bridges a formatting
+ * difference without widening what can match. An ABN is a unique identifier, so
+ * neither form can name a different business — and the caller's exactly-one rule
+ * still decides.
+ */
+export function abnQueryCandidates(digits: string): readonly string[] {
+  // Grouped first: it is what production actually holds, so the common case
+  // costs one call. Digits second, for tenants (or future rows) storing it bare.
+  return [formatAbn(digits), digits];
+}

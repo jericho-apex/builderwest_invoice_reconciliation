@@ -102,6 +102,10 @@ export async function decideMatch(
             purchaseOrderNumber: fields.purchaseOrderNumber,
             matchCount:
               workOrderResolution.status === "ambiguous" ? workOrderResolution.matchCount : 0,
+            // What was actually asked of Prime, so this one row answers "why did
+            // this miss?" without joining prime.find_work_order rows on
+            // timestamps. An empty array means Prime was never asked at all.
+            candidateLabels: workOrderResolution.candidateLabels,
           },
         },
       ],
@@ -109,6 +113,26 @@ export async function decideMatch(
   }
 
   const workOrder = workOrderResolution.workOrder;
+
+  // Approving against a label that is not literally what the invoice printed is
+  // the same category of event as pipeline.supplier_assumed: a normal
+  // expectation was bent and money moved anyway, so it goes in the audit trail.
+  // It also makes "how load-bearing is the bridge in production?" a one-line
+  // count — the evidence for asking Builderwest to standardize work-order
+  // labels. Silent on the happy path, so it adds no routine noise.
+  const workOrderAuditEvents: DecisionAuditEvent[] = workOrderResolution.matchedViaPrefixBridge
+    ? [
+        {
+          eventType: "pipeline.work_order_matched_by_bridge",
+          detail: {
+            purchaseOrderNumber: fields.purchaseOrderNumber,
+            matchedLabel: workOrderResolution.matchedLabel,
+            candidateLabels: workOrderResolution.candidateLabels,
+            workOrderId: workOrder.id,
+          },
+        },
+      ]
+    : [];
 
   const supplierResolution = await resolveSupplier(
     {
@@ -132,7 +156,7 @@ export async function decideMatch(
         decision: "exception",
         exceptionReason: "supplierNotFound",
       },
-      auditEvents: [],
+      auditEvents: workOrderAuditEvents,
     };
   }
 
@@ -190,7 +214,8 @@ export async function decideMatch(
         decision: "exception",
         exceptionReason: "costMismatch",
       },
-      auditEvents: supplierAuditEvents,
+      // Work order first, then supplier — the order the checks ran in.
+      auditEvents: [...workOrderAuditEvents, ...supplierAuditEvents],
     };
   }
 
@@ -205,6 +230,6 @@ export async function decideMatch(
       withinTolerance: true,
       decision: "approve",
     },
-    auditEvents: supplierAuditEvents,
+    auditEvents: [...workOrderAuditEvents, ...supplierAuditEvents],
   };
 }

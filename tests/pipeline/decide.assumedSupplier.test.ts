@@ -40,7 +40,15 @@ describe("decideMatch with an assumed supplier", () => {
   beforeEach(() => {
     resolveWorkOrder.mockReset();
     resolveSupplier.mockReset();
-    resolveWorkOrder.mockResolvedValue({ status: "matched", workOrder: WORK_ORDER });
+    resolveWorkOrder.mockResolvedValue({
+      status: "matched",
+      workOrder: WORK_ORDER,
+      // The printed form matched directly, so the PO-prefix bridge is not in
+      // play and emits nothing — see decide.workOrderBridge.test.ts.
+      matchedLabel: "PO21266",
+      matchedViaPrefixBridge: false,
+      candidateLabels: ["PO21266", "21266"],
+    });
   });
 
   it("approves on cost alone, carrying no contact and recording what was assumed", async () => {
@@ -91,7 +99,10 @@ describe("decideMatch with an assumed supplier", () => {
   });
 
   it("does not reach the supplier at all when the PO is unresolved", async () => {
-    resolveWorkOrder.mockResolvedValue({ status: "not_found" });
+    resolveWorkOrder.mockResolvedValue({
+      status: "not_found",
+      candidateLabels: ["PO21266", "21266"],
+    });
 
     const decision = await decideMatch(FIELDS, context);
 
