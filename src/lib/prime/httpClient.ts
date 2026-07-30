@@ -22,6 +22,73 @@ export class PrimeApiError extends Error {
   }
 }
 
+/**
+ * Wraps a write payload in the envelope Prime's write endpoints require:
+ * `{ attributes: { ... } }`.
+ *
+ * VERIFIED LIVE 2026-07-30, against production, on `POST /attachments`:
+ *
+ * - `{ attributes: {...} }`            -> 200, record created
+ * - `{ ...fields }` (flat)             -> 500 Internal Error
+ * - `{ data: { type, attributes } }`   -> 500 Internal Error
+ *
+ * The last one is the trap. Prime v2 speaks JSON:API on the way OUT — every read
+ * in this client pulls fields from `data.attributes` — so the full JSON:API
+ * envelope is the natural guess on the way IN, and it fails exactly as hard as
+ * sending nothing at all.
+ *
+ * Why this cost a live run to find: Prime answers a *validation* failure with a
+ * clean 422 naming each field (`"The attributes.file name field is required."` —
+ * note the `attributes.` prefix, which is where the answer was hiding). But a flat
+ * body does not fail validation, it crashes the handler before validation runs, and
+ * the 500 body is nothing but an opaque correlation id. So the failure carried no
+ * signal at all, while the empty-body 422 carried the whole answer.
+ *
+ * It lives here, next to primeRequest, because it is a property of Prime's
+ * transport rather than of any one resource — and it is a named function rather
+ * than an inline `{ attributes: body }` at three call sites so the evidence above
+ * has somewhere to live.
+ */
+export function primeWriteBody(attributes: Record<string, unknown>): {
+  attributes: Record<string, unknown>;
+} {
+  return { attributes };
+}
+
+/**
+ * What to record when a call fails — `String(error)` plus, for a Prime failure, the
+ * two things it actually carries.
+ *
+ * WHY THIS EXISTS. The AP-invoice create 500'd on the live run of 2026-07-30 and the
+ * audit row held one string: "PrimeApiError: Prime API request failed: POST
+ * /accounts-payable-invoices -> 500". The status and the response body were both
+ * dropped by `String(error)` — and Prime's 500 body is the only content that call
+ * returns: `{"message":"Internal Error: <uuid>"}`, the correlation id Prime support
+ * needs to look the crash up on their side. A 422 body is worth even more, since it
+ * names every field that failed. So the tick burned a live run and produced no
+ * evidence of what Prime objected to.
+ *
+ * It lives here because PrimeApiError does, and takes `unknown` because the callers
+ * that need it (the orchestrator's catch) are not Prime-specific.
+ */
+export function describeError(error: unknown): {
+  error: string;
+  primeStatus?: number;
+  primeResponseBody?: unknown;
+} {
+  if (!(error instanceof PrimeApiError)) {
+    return { error: String(error) };
+  }
+  return {
+    error: String(error),
+    primeStatus: error.status,
+    // Omitted rather than set to undefined when Prime's body could not be parsed:
+    // a `primeResponseBody: null` in the audit trail reads as "Prime answered with
+    // nothing", which is a different fact from "we could not read the answer".
+    ...(error.body === undefined ? {} : { primeResponseBody: error.body }),
+  };
+}
+
 export function isRetryablePrimeError(error: unknown): boolean {
   if (error instanceof PrimeApiError) {
     return error.status === 429 || error.status >= 500;

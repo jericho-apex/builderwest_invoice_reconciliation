@@ -15,6 +15,8 @@
     "extract:sample": "tsx --env-file-if-exists=.env.local scripts/extract-sample.ts",
     "pipeline:sample": "tsx --env-file-if-exists=.env.local scripts/pipeline-sample.ts",
     "discover:prime": "tsx --env-file-if-exists=.env.local scripts/discover-prime.ts",
+    "reset:test-invoices": "tsx --env-file-if-exists=.env.local scripts/reset-test-invoices.ts",
+    "tick:once": "tsx --env-file-if-exists=.env.local scripts/run-tick.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",

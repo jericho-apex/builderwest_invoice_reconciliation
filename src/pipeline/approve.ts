@@ -11,7 +11,7 @@ import { appendAuditLog, type AuditLogInput } from "../db/repositories/auditLog.
 import { getPdfAttachments } from "../lib/graph/mailbox.js";
 import { moveMessage } from "../lib/graph/folders.js";
 import { uploadAttachment } from "../lib/prime/attachments.js";
-import { createApInvoice, approveApInvoice, readBackApInvoice } from "../lib/prime/apInvoices.js";
+import { createApInvoice, readBackApInvoice } from "../lib/prime/apInvoices.js";
 import { routeToException } from "./exception.js";
 
 type AuditContext = Pick<AuditLogInput, "invoiceId" | "messageId">;
@@ -62,17 +62,23 @@ function isWriteFencedOut(invoice: InvoiceRecord): boolean {
 
 /**
  * Drives an invoice through the approve flow (PRD §4.1 step 5 / §5.1 approve-flow
- * ordering: upload attachment -> create AP invoice -> approve), one
- * persisted-stage step at a time. Resumable by design: every step reads the
- * invoice's current `stage` and persists the Prime ID it just acquired before
- * moving to the next step, so a worker restart (or the next tick's in-flight
+ * ordering), one persisted-stage step at a time. Resumable by design: every step
+ * reads the invoice's current `stage` and persists the Prime ID it just acquired
+ * before moving to the next step, so a worker restart (or the next tick's in-flight
  * resume-scan) picks up exactly where it left off instead of re-running completed
- * Prime writes.
+ * Prime writes. That is what made the failed runs of 2026-07-30 safe to retry: two
+ * invoices sat at `ap_created` with their real AP-invoice ids, and the retry verified
+ * them rather than creating a second payable.
+ *
+ * TWO PRIME WRITES, NOT THREE: upload attachment -> create AP invoice (approved on
+ * creation) -> verify. The approve step was a third write until 2026-07-30, when the
+ * live run showed `PATCH /accounts-payable-invoices/{id}` returns 405 and that Prime
+ * creates the record already approved. See `createApInvoice`'s `approvalStatus`.
  *
  * APPROVAL IS THE END OF THE LINE. The flow used to go on to poll Prime's
  * `isSynced` field until its Xero push landed, and to route to
  * Exceptions/Xero sync failed when it never did. Both are gone: the push does not
- * follow approval (see approveApInvoice for the production evidence), so waiting on
+ * follow approval (see apInvoices.ts for the production evidence), so waiting on
  * it only ever produced a timeout that meant nothing. Builderwest's finance process
  * owns the push from here.
  */
@@ -177,13 +183,36 @@ export async function advanceApproveFlow(
           throw new Error(`advanceApproveFlow: invoice ${invoiceId} missing AP invoice ID at stage ap_created`);
         }
 
-        await approveApInvoice(invoice.primeApInvoiceId, context);
+        // NO WRITE HERE. This step used to PATCH the approval status; that endpoint
+        // returns 405 and does not exist. Approval is requested on the create
+        // (`createApInvoice`'s `approvalStatus`) and Prime applies it there, so all
+        // that is left is to confirm it — one GET, which also confirms the
+        // work-order link survived the create. See readBackApInvoice.
+        const record = await readBackApInvoice(invoice.primeApInvoiceId, context);
 
-        // Read the record back before finishing. Not a gate — whatever it says,
-        // the invoice is approved and the pipeline is done — but it is the only
-        // confirmation that the work-order link survived the create, and it costs
-        // one GET. See readBackApInvoice.
-        await readBackApInvoice(invoice.primeApInvoiceId, context);
+        // And it IS a gate, unlike the read-back's other observations. "Approved" is
+        // the one thing this pipeline exists to do to an invoice, and `approved` is a
+        // terminal stage that moves the message to Processed — so recording it on a
+        // record Prime did not approve would report success for work that never
+        // happened, in the one place nobody would go back and check.
+        //
+        // Throwing leaves the invoice at `ap_created` for the next tick's in-flight
+        // resume to retry, which costs one GET and re-audits the error each time.
+        // That is deliberate: no Prime write is repeated, nothing is fabricated, and a
+        // recurring error row is the signal. If this ever actually fires, the follow-up
+        // is a dedicated exception folder (there is no honest existing one — the
+        // invoice matched cleanly and nothing about it is unreadable), not a default.
+        if (record.approvalStatus !== "Approved") {
+          appendAuditLog({
+            ...context,
+            eventType: "pipeline.ap_invoice_not_approved",
+            detail: { apInvoiceId: invoice.primeApInvoiceId, approvalStatus: record.approvalStatus },
+            isError: true,
+          });
+          throw new Error(
+            `advanceApproveFlow: invoice ${invoiceId} AP invoice ${invoice.primeApInvoiceId} came back approvalStatus=${String(record.approvalStatus)}, not Approved`,
+          );
+        }
 
         setApproved(invoiceId);
         continue;

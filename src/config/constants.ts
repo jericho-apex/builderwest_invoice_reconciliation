@@ -57,6 +57,30 @@ export const PRIME_ATTACHMENT_STATUS = "Published";
 export const PRIME_ATTACHMENT_OBJECT_TYPE = "Job";
 
 /**
+ * The lifecycle status every AP invoice is CREATED with — a required field on
+ * `POST /accounts-payable-invoices` that this pipeline was not sending, which is what
+ * crashed Prime's handler on the live runs of 2026-07-30
+ * (`Attempt to read property "name" on null`; see apInvoices.ts's createApInvoice).
+ *
+ * WHY "New" AND NOT ONE OF THE OTHER SIX. Prime documents seven values — New, Sent,
+ * Awaiting Approval, Approved, Part Paid, Paid, Cancelled — and production says which
+ * one an invoice created by this pipeline belongs in. The single production AP invoice
+ * that was created and approved but never paid sits at `accountsPayableInvoiceStatus:
+ * "New"` with `approvalStatus: "Approved"`, which is precisely the state this pipeline
+ * leaves an invoice in: approved, not yet paid, not yet synced. The 12 that reached
+ * "Paid" got there later and in a batch, i.e. by Builderwest's payment run.
+ *
+ * So this must never drift toward "Paid" or any other synced/paid value: that asserts
+ * payment before payment has happened, and Builderwest's finance process owns that
+ * transition. It is the same rule as the stop-at-approved decision below, applied to
+ * the create rather than to the approval.
+ *
+ * "Awaiting Approval" would also be wrong, if more subtly — the pipeline approves the
+ * invoice seconds later, so it would describe a review queue the invoice never sits in.
+ */
+export const PRIME_AP_INVOICE_INITIAL_STATUS = "New";
+
+/**
  * THE PIPELINE STOPS AT APPROVED. It does not wait for, or verify, Prime's push
  * to Xero — decided with Builderwest on 2026-07-29 after reading all 15 of their
  * production AP invoices.

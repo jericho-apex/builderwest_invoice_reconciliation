@@ -48,11 +48,9 @@ vi.mock("../../src/lib/prime/attachments.js", () => ({
 }));
 
 const createApInvoice = vi.fn();
-const approveApInvoice = vi.fn();
 const readBackApInvoice = vi.fn();
 vi.mock("../../src/lib/prime/apInvoices.js", () => ({
   createApInvoice: (...a: unknown[]) => createApInvoice(...a),
-  approveApInvoice: (...a: unknown[]) => approveApInvoice(...a),
   readBackApInvoice: (...a: unknown[]) => readBackApInvoice(...a),
 }));
 
@@ -113,7 +111,6 @@ beforeEach(() => {
   ]);
   uploadAttachment.mockResolvedValue("attachment-real");
   createApInvoice.mockResolvedValue("ap-invoice-real");
-  approveApInvoice.mockResolvedValue(undefined);
   readBackApInvoice.mockResolvedValue({
     approvalStatus: "Approved",
     accountsPayableInvoiceStatus: "New",
@@ -147,7 +144,7 @@ describe("the live-write fence", () => {
 
     expect(uploadAttachment).not.toHaveBeenCalled();
     expect(createApInvoice).not.toHaveBeenCalled();
-    expect(approveApInvoice).not.toHaveBeenCalled();
+    expect(readBackApInvoice).not.toHaveBeenCalled();
     const invoice = getInvoiceById(invoiceId)!;
     expect(invoice.primeAttachmentId).toBeNull();
     expect(invoice.primeApInvoiceId).toBeNull();
@@ -188,7 +185,9 @@ describe("the live-write fence", () => {
     expect(getInvoiceById(invoiceId)!.stage).toBe("approved");
     expect(uploadAttachment).toHaveBeenCalled();
     expect(createApInvoice).toHaveBeenCalled();
-    expect(approveApInvoice).toHaveBeenCalledWith("ap-invoice-real", expect.anything());
+    // The approval is verified, not written: the third write (a PATCH) returned 405
+    // and is gone, so the create carries `approvalStatus` and this GET confirms it.
+    expect(readBackApInvoice).toHaveBeenCalledWith("ap-invoice-real", expect.anything());
   });
 
   it("honours every entry in the list, not just the first", async () => {
@@ -197,5 +196,63 @@ describe("the live-write fence", () => {
     await advanceApproveFlow(invoiceId, { invoiceId, messageId: "msg-fence-5" });
 
     expect(getInvoiceById(invoiceId)!.stage).toBe("approved");
+  });
+});
+
+/**
+ * The approval gate, which shares this file's harness because it guards the same live
+ * write path (and this is the only suite that runs with PRIME_DRY_RUN=false).
+ *
+ * Prime creates AP invoices already approved, so the third write is gone and
+ * `approvalStatus` rides on the create. That makes the read-back the ONLY thing
+ * standing between "Prime did not approve this" and a terminal `approved` stage with
+ * the message filed in Processed — i.e. a success report for work that never happened,
+ * in the one place nobody re-checks.
+ */
+describe("the approval gate on the read-back", () => {
+  it("records approved only when Prime says Approved", async () => {
+    const invoiceId = invoiceReadyToWrite("wo-test-allowed");
+
+    const result = await advanceApproveFlow(invoiceId, { invoiceId, messageId: "msg-gate-1" });
+
+    expect(result).toBe("completed");
+    expect(getInvoiceById(invoiceId)!.stage).toBe("approved");
+  });
+
+  it("refuses to record approved when the record came back unapproved", async () => {
+    readBackApInvoice.mockResolvedValue({
+      approvalStatus: "Pending",
+      accountsPayableInvoiceStatus: "New",
+      workOrderId: "wo-test-allowed",
+      isSynced: false,
+    });
+    const invoiceId = invoiceReadyToWrite("wo-test-allowed");
+
+    await expect(
+      advanceApproveFlow(invoiceId, { invoiceId, messageId: "msg-gate-2" }),
+    ).rejects.toThrow(/not Approved/);
+
+    // Left at ap_created for the next tick to re-verify — no Prime write is repeated,
+    // and the AP invoice id is still recorded so nothing gets created twice.
+    const invoice = getInvoiceById(invoiceId)!;
+    expect(invoice.stage).toBe("ap_created");
+    expect(invoice.primeApInvoiceId).toBe("ap-invoice-real");
+    expect(auditEventTypes(invoiceId)).toContain("pipeline.ap_invoice_not_approved");
+    // And the message stays put: Processed would tell the accounts team this invoice
+    // is done.
+    expect(moveMessage).not.toHaveBeenCalled();
+  });
+
+  // A missing approvalStatus is not an approval either. The read-back tolerates
+  // several response shapes, so "absent" is a real possibility, and it must fail
+  // closed rather than read as a pass.
+  it("treats an absent approvalStatus as not approved", async () => {
+    readBackApInvoice.mockResolvedValue({ isSynced: false });
+    const invoiceId = invoiceReadyToWrite("wo-test-allowed");
+
+    await expect(
+      advanceApproveFlow(invoiceId, { invoiceId, messageId: "msg-gate-3" }),
+    ).rejects.toThrow(/not Approved/);
+    expect(getInvoiceById(invoiceId)!.stage).toBe("ap_created");
   });
 });

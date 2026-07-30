@@ -27,10 +27,12 @@
  *   npm run discover:prime -- PO21340 PO21342   # specific POs
  *   npm run discover:prime -- --ap-invoices     # the AP-invoice status model
  *   npm run discover:prime -- --ap <id>         # one AP invoice, every field
+ *   npm run discover:prime -- --verify          # AFTER a run: did the writes land?
  *
  * It runs migrations first because the Prime finders append audit_log rows.
  */
 import { runMigrations } from "../src/db/migrate.js";
+import { getDb } from "../src/db/client.js";
 import { loadEnv } from "../src/config/env.js";
 import { primeRequest } from "../src/lib/prime/httpClient.js";
 import { buildEqQuery } from "../src/lib/prime/query.js";
@@ -204,6 +206,194 @@ async function reportApInvoiceStatuses(): Promise<void> {
   }
 }
 
+interface LocalInvoiceRow {
+  id: number;
+  stage: string;
+  exception_reason: string | null;
+  extracted_purchase_order_number: string | null;
+  extracted_invoice_number: string | null;
+  extracted_total_amount_cents: number | null;
+  prime_work_order_id: string | null;
+  prime_job_id: string | null;
+  prime_contact_id: string | null;
+  prime_attachment_id: string | null;
+  prime_ap_invoice_id: string | null;
+}
+
+/**
+ * POST-RUN VERIFICATION: did what the pipeline THINKS it wrote actually land in
+ * Prime, and land correctly?
+ *
+ * Every other mode in this script asks Prime what it holds. This one starts from
+ * the local `invoices` rows — the pipeline's own claims — and checks each against
+ * production. That direction matters: reading Prime alone cannot tell you an
+ * invoice was skipped, and reading SQLite alone cannot tell you a write silently
+ * didn't take. Only the comparison answers "did it work".
+ *
+ * Still GETs only. It never cleans anything up — deleting or voiding a test AP
+ * invoice in Prime is Builderwest's job, not this script's.
+ */
+async function verifyAgainstLocalState(): Promise<void> {
+  const rows = getDb()
+    .prepare<[], LocalInvoiceRow>(
+      `SELECT id, stage, exception_reason, extracted_purchase_order_number,
+              extracted_invoice_number, extracted_total_amount_cents, prime_work_order_id,
+              prime_job_id, prime_contact_id, prime_attachment_id, prime_ap_invoice_id
+         FROM invoices ORDER BY id`,
+    )
+    .all();
+
+  if (rows.length === 0) {
+    console.log("\n  No local invoices rows — nothing has run yet.");
+    return;
+  }
+
+  let checked = 0;
+  let passed = 0;
+
+  for (const row of rows) {
+    const label = `#${row.id} ${row.extracted_purchase_order_number ?? "(no PO)"} invoice ${row.extracted_invoice_number ?? "?"}`;
+    const stage = `${row.stage}${row.exception_reason ? `:${row.exception_reason}` : ""}`;
+    console.log(`\n  ${label}  local stage=${stage}`);
+
+    if (!row.prime_ap_invoice_id) {
+      console.log("    no AP invoice recorded — stopped before the write path. Nothing to verify.");
+      console.log(`    (expected for an exception; this one is ${stage})`);
+      continue;
+    }
+
+    if (row.prime_ap_invoice_id.startsWith("dryrun-")) {
+      console.log(`    ${row.prime_ap_invoice_id}`);
+      console.log("    DRY-RUN PLACEHOLDER — nothing was written to Prime, so nothing to check.");
+      continue;
+    }
+
+    checked += 1;
+    let record: ApiRow | undefined;
+    try {
+      const response = await primeRequest<{ data?: ApiRow }>({
+        method: "GET",
+        path: `/accounts-payable-invoices/${row.prime_ap_invoice_id}`,
+      });
+      record = response.data;
+    } catch (error) {
+      console.log(`    GET /accounts-payable-invoices/${row.prime_ap_invoice_id} FAILED:`);
+      console.log(`      ${String(error)}`);
+      console.log("    => the id we persisted does not resolve in Prime. Investigate before rerunning.");
+      continue;
+    }
+
+    const a = record?.attributes ?? {};
+    console.log(`    prime record ${row.prime_ap_invoice_id}`);
+    console.log(
+      `      ${JSON.stringify({
+        invoiceNumber: a.invoiceNumber,
+        amount: a.amount,
+        taxTotal: a.taxTotal,
+        approvalStatus: a.approvalStatus,
+        accountsPayableInvoiceStatus: a.accountsPayableInvoiceStatus,
+        isSynced: a.isSynced,
+        workOrderId: a.workOrderId,
+        jobId: a.jobId,
+        version: a.version,
+        createdAt: a.createdAt,
+      })}`,
+    );
+
+    // The four things a live write has to get right. Checked explicitly rather
+    // than left to the reader, because "a record came back" is not the question.
+    const expectedAmount = row.extracted_total_amount_cents;
+    const actualAmountCents =
+      a.amount === undefined || a.amount === null ? null : Math.round(Number(a.amount) * 100);
+
+    const checks: Array<[string, boolean, string]> = [
+      [
+        "amount is the inc-GST invoice total",
+        expectedAmount !== null && actualAmountCents === expectedAmount,
+        `expected ${expectedAmount === null ? "?" : (expectedAmount / 100).toFixed(2)}, got ${String(a.amount)}`,
+      ],
+      [
+        "workOrderId survived the create (prime-api-gaps Q9)",
+        typeof a.workOrderId === "string" && a.workOrderId === row.prime_work_order_id,
+        `expected ${row.prime_work_order_id}, got ${String(a.workOrderId)}`,
+      ],
+      [
+        "jobId matches the matched work order's job",
+        typeof a.jobId === "string" && a.jobId === row.prime_job_id,
+        `expected ${row.prime_job_id}, got ${String(a.jobId)}`,
+      ],
+      [
+        "approvalStatus is Approved",
+        a.approvalStatus === "Approved",
+        `got ${String(a.approvalStatus)}`,
+      ],
+    ];
+
+    let allPassed = true;
+    for (const [what, ok, detail] of checks) {
+      console.log(`      ${ok ? "PASS" : "FAIL"}  ${what}${ok ? "" : ` — ${detail}`}`);
+      allPassed = allPassed && ok;
+    }
+    if (allPassed) {
+      passed += 1;
+    }
+
+    // Not a failure: the pipeline deliberately stops at approved and Builderwest's
+    // finance process owns the Xero push (prime-api-gaps Q6). Printed so an
+    // unsynced record is never mistaken for a broken run.
+    if (a.isSynced !== true) {
+      console.log(
+        "      note  not synced to Xero — EXPECTED. The pipeline stops at approved by design.",
+      );
+    }
+
+    console.log(`      attachment ${row.prime_attachment_id ?? "(none)"} — check it on Prime job ${row.prime_job_id ?? "?"}`);
+  }
+
+  console.log(`\n  ${passed}/${checked} live AP invoice(s) fully verified.`);
+  if (checked === 0) {
+    console.log("  (nothing live to verify — the last run was a dry run)");
+  }
+}
+
+/**
+ * Cross-check from Prime's side: every AP invoice currently attached to the test
+ * work orders. This is what catches DUPLICATES — two records for one invoice
+ * because a run was repeated without resetting local state — which the
+ * local-state check above cannot see, since SQLite only remembers the last id.
+ */
+async function reportApInvoicesForWorkOrder(po: string, poField: string): Promise<void> {
+  const { labels } = purchaseOrderCandidates(po);
+  const workOrders = new Map<string, ApiRow>();
+  for (const label of labels) {
+    for (const row of await findBy("/work-orders", poField, label)) {
+      workOrders.set(row.id, row);
+    }
+  }
+
+  for (const workOrder of workOrders.values()) {
+    const apInvoices = await findBy("/accounts-payable-invoices", "workOrderId", workOrder.id);
+    console.log(`\n  ${po} -> work order ${workOrder.id}: ${apInvoices.length} AP invoice(s)`);
+    for (const row of apInvoices) {
+      const a = row.attributes ?? {};
+      console.log(
+        `    ${JSON.stringify({
+          id: row.id,
+          invoiceNumber: a.invoiceNumber,
+          amount: a.amount,
+          approvalStatus: a.approvalStatus,
+          accountsPayableInvoiceStatus: a.accountsPayableInvoiceStatus,
+          isSynced: a.isSynced,
+          createdAt: a.createdAt,
+        })}`,
+      );
+    }
+    if (apInvoices.length > 1) {
+      console.log("    WARNING: more than one — check for a duplicate from a repeated run.");
+    }
+  }
+}
+
 /** Every field of one AP invoice — used to verify a live write round-tripped. */
 async function reportOneApInvoice(id: string): Promise<void> {
   const response = await primeRequest<{ data?: ApiRow }>({
@@ -236,6 +426,20 @@ async function main(): Promise<void> {
   if (apIndex !== -1 && args[apIndex + 1]) {
     await reportOneApInvoice(args[apIndex + 1]!);
     console.log("\nDone. Nothing was written to Prime.");
+    return;
+  }
+
+  if (args.includes("--verify")) {
+    console.log("\n=== Local pipeline state vs. what Prime actually holds ===");
+    await verifyAgainstLocalState();
+
+    console.log("\n=== AP invoices attached to the test work orders (duplicate check) ===");
+    const pos = explicitPos.length > 0 ? explicitPos : NEW_TEST_INVOICES.map((i) => i.po);
+    for (const po of pos) {
+      await reportApInvoicesForWorkOrder(po, env.PRIME_WORK_ORDER_PO_FIELD);
+    }
+
+    console.log("\nDone. Nothing was written to Prime — cleanup in Prime remains manual.");
     return;
   }
 

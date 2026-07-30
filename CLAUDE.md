@@ -26,6 +26,8 @@ npm start                    # node dist/worker/index.js (what Render runs)
 npm test                     # vitest run
 npm run pipeline:sample      # the six client PDFs -> decision, vs a fake Prime
 npm run discover:prime       # READ-ONLY production Prime lookups (see below)
+npm run tick:once            # ONE full worker tick, then exit (the live trigger)
+npm run reset:test-invoices  # purge local state so the same emails rerun
 npm run test:watch
 npm run lint                  # eslint .
 npm run format                # prettier --write .
@@ -34,8 +36,9 @@ npm run format                # prettier --write .
 Run a single test file: `npx vitest run tests/lib/matching/compareCost.test.ts`
 Run tests matching a name: `npx vitest run -t "some test name"`
 
-Three manual runners, all deliberately outside `npm test`, all loading
-`.env.local` if present:
+Five manual runners, all deliberately outside `npm test`, all loading
+`.env.local` if present. The first three are safe to run at will; the last two
+exist for the supervised end-to-end run and touch the live mailbox / local state:
 
 - `npm run extract:sample` runs the real extraction prompt against the dummy
   invoice PDFs in `docs/` and prints the JSON — the way to check a prompt change
@@ -57,7 +60,35 @@ Three manual runners, all deliberately outside `npm test`, all loading
   fixture's figures get established, and the reason to reach for it before
   inventing any: it is what revealed that Prime stores contact ABNs ATO-grouped.
   With no arguments it reports the three real test invoices; pass POs to look up
-  others.
+  others. `-- --verify` is the **post-run** mode: it starts from the local
+  `invoices` rows and checks each recorded AP invoice against production —
+  amount, `workOrderId`, `jobId`, `approvalStatus` — then lists every AP invoice
+  attached to the test work orders to catch a duplicate from a repeated run.
+  Reading Prime alone cannot tell you an invoice was skipped and reading SQLite
+  alone cannot tell you a write silently didn't take; only the comparison answers
+  "did it work".
+- `npm run tick:once` runs **one** `runTick()` and exits — the trigger for a
+  supervised end-to-end run, and the only runner that calls Graph or a Prime
+  write. `npm run dev` is the same pipeline on a `POLL_INTERVAL_MINUTES` loop,
+  which has to be interrupted by hand at the right moment; for a test you want
+  one tick, deterministically. It prints the mode banner (dry-run, fence, mailbox,
+  model) *before* acting, and **refuses to run** on `PRIME_DRY_RUN=false` with an
+  empty `PRIME_TEST_WORK_ORDER_IDS` unless `-- --unfenced` is passed. `loadEnv()`
+  only warns there, which is right for the deployed worker (an empty fence *is*
+  the go-live setting) and wrong for an ad-hoc trigger against a live mailbox.
+- `npm run reset:test-invoices` purges local pipeline state (`invoices`,
+  `match_results`, `processed_messages`; **never** `audit_log`) for a set of POs,
+  defaulting to the three on `BWC-WA-6797`, so the same emails run end to end
+  again from scratch. Preview-only unless `-- --confirm`. **Dragging the email to
+  `Retry` is not a substitute for it after a dry run:** `resetForRetry` sees a
+  non-null `prime_ap_invoice_id` and correctly resets to `ap_created` rather than
+  `received` to avoid duplicating a payable — but after a dry run that id is a
+  `dryrun-…` placeholder, so with live writes on the next tick would try to
+  *approve* a record that does not exist, having never uploaded the attachment or
+  created the real AP invoice. The invoice would look processed and nothing would
+  have reached Prime. Deleting the rows is what makes the dry-run → live
+  transition clean. It cannot undo a real Prime write — that cleanup is
+  Builderwest's.
 
 The first two source their PDF list from `tests/fixtures/clientDummyInvoices.ts`,
 which is also what the "client sample invoices" test block asserts against — add a
@@ -160,6 +191,63 @@ production environment. Two things make development safe without one:
   `BWC-WA-6797`, whose dummy work orders Tobey Chan created. Cleanup in Prime and
   Xero is theirs to do — **tell Tobey Chan and the client when a run finishes.**
 
+  **Two end-to-end live runs completed on 2026-07-30, and cleanup is outstanding on
+  both.** Each created and approved two AP invoices on the test claim, each with its
+  PDF attached to the job, and each routed `369.pdf` (PO21342) to
+  `Exceptions/Cost mismatch` on $396.00 against a $275.00 work order.
+  `discover:prime -- --verify` reported 4/4 PASS on every record. **Nothing is synced
+  to Xero, by design.**
+
+  | Run | PO21343 · `26.pdf` · $1,204.50 | PO21340 · `invoice_300.pdf` · $660.00 |
+  |---|---|---|
+  | 06:44 (fixing the write path) | AP `1e2bd578…` att `38bcffe4…` | AP `27bb18ae…` att `b2489ebc…` |
+  | 07:20 (clean re-run) | AP `1f2bed35…` att `b73f3c60…` | AP `71020f40…` att `949f58df…` |
+
+  So **each of those two work orders now carries two identical approved payables** —
+  deliberately, after a reset with the previous pair left in place, and
+  `discover:prime -- --verify` flags them as the duplicate warning it exists for.
+  Four payables and four attachments for Builderwest to clear.
+
+  The 07:20 run is the better evidence of the two: it drove all three invoices from
+  `received` to terminal **in a single tick with zero `audit_log` errors** — poll,
+  extract, derive, match, upload, create, verify, move — whereas the 06:44 run only
+  reached the create by resuming a half-finished invoice.
+
+  **Nothing was orphaned, and that is the resumability guarantee showing its work.**
+  Across six ticks and three different failures there are exactly **two** real
+  attachment uploads in `audit_log` (`38bcffe4…` `26.pdf`, `b2489ebc…`
+  `invoice_300.pdf`, both 06:11) and both are the ones the two AP invoices
+  reference: the ticks that resumed from `attachment_uploaded` reused the persisted
+  id instead of uploading again. Everything from 2026-07-29 is `.dry_run` and
+  reached Prime not at all.
+
+  **Neither resource can be deleted through the API** — `DELETE` on
+  `/accounts-payable-invoices/{id}` and `/attachments/{id}` both return 405
+  "Endpoint not currently available". Clearing test records means the Prime UI, or
+  setting the AP invoice's lifecycle status to `Cancelled` through
+  `PATCH /accounts-payable-invoices/{id}/relationships/accountsPayableInvoiceStatus`
+  (a state 2 of the 15 production records are in). So **a live re-run against the
+  same invoices duplicates the payables** unless the previous pair is cleared first.
+
+**`GRAPH_SEND_MAIL_REDIRECT_TO_TEST=true` (the default) is the same control for
+outbound email.** `routeToException` replies to the invoice's own sender, which is
+correct at go-live and wrong during the pilot: the sample invoices are from real
+subcontractors, so an unreadable one would email a real trade business asking it to
+resend paperwork. With the redirect on, every auto-reply goes to
+`GRAPH_TEST_RECIPIENT` instead, the subject is prefixed
+`[TEST — not sent to supplier]`, the body states the intended address, and the
+audit row carries `intendedRecipient` + `redirected` so the trail answers "who did
+this actually reach" without the reader knowing the config at the time.
+
+It is enforced in `lib/graph/sendMail.ts`, not at the call site — a fence a caller
+has to remember to apply is not a fence, so every current and future caller
+inherits it. `loadEnv()` requires `GRAPH_TEST_RECIPIENT` whenever outbound mail is
+enabled (not just when the redirect is on, so re-enabling the redirect is never
+blocked by a missing value) and warns when send-mail is on with the redirect off.
+The asymmetry with `PRIME_DRY_RUN` is deliberate: a Prime write can be voided, a
+sent email cannot, so the safe value is the **default** rather than something to
+remember to turn on. `tests/lib/graph/sendMail.test.ts` is its dedicated suite.
+
 `ASSUME_SUPPLIER_MATCHED=true` is a **test-run-only** third switch: an invoice
 whose supplier does not resolve to exactly one Prime contact continues to the
 cost check as `"assumed"` instead of routing to `Exceptions/Supplier not found`.
@@ -223,6 +311,18 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
 - `filter.ts` — free structural pre-filter (dedupe, has-PDF-attachment check)
   before any AI call. Deliberately has no sender-allowlist/subject-pattern
   filter yet (needs real patterns from Builderwest first).
+
+  **Dedupe is per MESSAGE, not per invoice — a known gap with a real cost.** The
+  2026-07-30 run surfaced it by accident: `369.pdf` arrived in two separate emails, and
+  because `processed_messages` and the `invoices` UNIQUE key are both keyed on
+  `message_id`, it became two invoice rows (9 and 10) that each ran the full pipeline.
+  Both were `costMismatch`, so nothing was written — but the same invoice arriving twice
+  and *matching* would create **two AP invoices in Prime**, i.e. a duplicate payable, and
+  nothing in the pipeline would notice. A supplier re-sending "in case you missed it" is
+  the ordinary way this happens. The fix is an invoice-level check (supplier +
+  `invoiceNumber`, or PO + `invoiceNumber`, against non-exception rows) before the write
+  path — not yet implemented, and it needs Builderwest's answer on whether a supplier
+  ever legitimately reuses an invoice number across POs.
 - `orchestrator.ts` — `processMessage` (classify → create one `invoices` row
   per PDF attachment → drive) and `driveInvoice` (extract → `decideMatch` →
   persist the outcome → approve flow or exception routing). Between extraction
@@ -243,11 +343,16 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   reconstruct. Not side-effect free though: the Prime finders write their own
   `audit_log` rows, so a migrated DB is still required.
 - `approve.ts` — `advanceApproveFlow`, a stage-by-stage loop: upload attachment
-  → create AP invoice → approve → read the record back. **`approved` is terminal**;
-  the flow no longer waits for Prime's Xero push, because the push does not follow
-  approval (see `prime/apInvoices.ts` and prime-api-gaps.md Q6). The read-back is
-  observation, not a gate — one GET whose only job is to confirm `workOrderId`
-  survived the create, recorded as `prime.read_back_ap_invoice`.
+  → create AP invoice (approved on creation) → read the record back and verify.
+  **Two Prime writes, not three** — the old third write, a PATCH to set the approval
+  status, returns 405 and is gone; `createApInvoice` carries `approvalStatus` instead.
+  **`approved` is terminal**; the flow no longer waits for Prime's Xero push, because
+  the push does not follow approval (see `prime/apInvoices.ts` and
+  prime-api-gaps.md Q6). The read-back **is** a gate on `approvalStatus` — it is now the
+  only thing between "Prime did not approve this" and a terminal stage that files the
+  message in `Processed` — while its other observations (`workOrderId` survived the
+  create) stay observations. Recorded as `prime.read_back_ap_invoice`, with
+  `pipeline.ap_invoice_not_approved` if the gate holds.
   Two gates run at the `matched` stage **before** the upload, so a refusal never
   orphans an attachment on the Prime job: the required-fields check
   (→ `Exceptions/Unreadable`) and the live-write fence
@@ -276,6 +381,71 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   concurrent, 5000/day) — don't adjust without confirming new figures against
   Prime's docs.
 
+  **Every Prime WRITE body must be wrapped in `{ attributes: {...} }`** —
+  `httpClient.ts`'s `primeWriteBody`, applied by all three write callers. Verified
+  live on 2026-07-30 against `POST /attachments`: `{ attributes: {...} }` → 200,
+  flat fields → 500, and **the full JSON:API envelope
+  `{ data: { type, attributes } }` → 500 as well.** That last one is the trap:
+  Prime speaks JSON:API on the way *out*, so every read here pulls from
+  `data.attributes`, which makes the full envelope the natural guess on the way in
+  — and it fails as hard as sending nothing.
+
+  This cost a live run to find because the failure carried no signal. Prime answers
+  a genuine *validation* failure with a clean 422 naming each field
+  (`"The attributes.file name field is required."` — the `attributes.` prefix was
+  the whole answer), but a flat body crashes the handler *before* validation, and
+  the 500 body is only an opaque correlation id. **The diagnostic that cracked it
+  was POSTing `{}`** — an empty body reaches the validator and it lists the real
+  field paths. Reach for that first on any new Prime write endpoint.
+
+  **`describeError` is why the next 500 will be cheaper.** Both live failures so far
+  cost a run largely because the only trace was `String(error)`, which drops
+  `PrimeApiError`'s `status` and `body` — and the body is the whole diagnostic (a
+  500's message or correlation id, a 422's per-field errors). `httpClient.ts`'s
+  `describeError` preserves both into the log line and the `pipeline.unhandled_error`
+  audit row. It found the AP-create crash on the first tick after being added.
+
+  The deeper lesson, now written into `attachments.ts`: the old comment claimed the
+  request shape was "verified against production" when what had actually been done
+  was *read stored resources*. Storage shape ≠ request shape — a stored attachment
+  has no `file` field at all, only server-derived `url`/`mimeType`/`size`. Verify a
+  write by writing, or say it is unverified.
+
+  **THE AP-INVOICE CREATE BODY, settled by a working live write on 2026-07-30.** Two
+  fields were missing and one was surplus; the missing status is what made
+  `POST /accounts-payable-invoices` answer 500 `Attempt to read property "name" on null`
+  for three consecutive live runs.
+
+
+  - **`accountsPayableInvoiceStatus`** (`PRIME_AP_INVOICE_INITIAL_STATUS`, `"New"`) —
+    documented as required as one half of an either/or with
+    `accountsPayableInvoiceStatusId`, and the half that takes a status **Name**, which
+    is precisely the property the crash dereferenced on null. **Prime's live validator
+    does not enforce this pair**: the empty-body 422 lists seven fields and no status.
+    So the docs are *stricter* than the validator here — the exact reverse of
+    `workOrderId` — and **neither source is authoritative alone**. A required field the
+    validator ignores fails as a 500 with no signal instead of a 422 that names it.
+    `"New"` because the one production record created-and-approved-but-never-paid sits
+    there; the 12 that reached `"Paid"` got there later via a payment run.
+  - **`approvalStatus: "Approved"`** — approval happens on the create. There is no
+    separate approve call any more (see below).
+  - **`workOrderId` alone**, not the sibling `workOrder`. Docs and the live 422 agree
+    they are either/or (`workOrderId` "required if attributes.workOrder is not
+    presented" and vice versa); an empty body trips both halves at once, which is what
+    was once misread here as "Prime requires both". `workOrder` wants the work-order
+    **Number** — the PO label — so the removed line was feeding it a UUID. 15/15
+    production records store `workOrderId`; none store `workOrder`.
+
+  `accountNumber` is **not** required — both live records came back with it null. It was
+  a plausible suspect (15/15 production AP invoices snapshot it from the supplier
+  contact's `purchasesAccountNumber`, which all three test suppliers lack) and it was
+  wrong. **Do not send an invented one:** Prime accepts the field, so a fabricated GL
+  code would "work" and would sit on a real payable. prime-api-gaps.md W2b has the full
+  elimination and the two probe techniques, both of which are reusable: every probe
+  omits one required field so validation must reject it (nothing can be created), and a
+  candidate field sent with a deliberately wrong **type** reveals whether the endpoint
+  has a rule for it at all.
+
   **Prime's money model** (read off 15 production AP invoices on 2026-07-28, and
   the same convention on work orders): `tax` is a **rate** (`0.1000`), `taxTotal`
   is the GST **amount** Prime calculates itself, and `amount` is the
@@ -287,15 +457,35 @@ move — never derive "current state" from it, that's `invoices.stage`'s job).
   `data.id`, JSON:API style; every resource carries an integer `version` for
   optimistic concurrency.
 
-  **`approveApInvoice` will not trigger the Xero push, and that is now known
-  rather than suspected.** Read off all 15 production AP invoices on 2026-07-29:
-  the one record at `approvalStatus: "Approved"` with its lifecycle status still
-  `New` has never synced in two years — which is exactly the state this code
-  leaves an invoice in. All 12 synced records are at
+  **THERE IS NO APPROVE CALL — two Prime writes, not three.** `approveApInvoice` used
+  to `PATCH /accounts-payable-invoices/{id}`. That endpoint does not exist: it answers
+  **405 "Endpoint not currently available"** (live, 2026-07-30 — the step that failed as
+  soon as the create started working). The docs offer `PUT /accounts-payable-invoices/{id}`
+  with the record's `version` instead, deliberately not implemented: it is
+  replace-semantics on a live payable and it is not needed, because **Prime creates an
+  AP invoice already approved**. Both records created on 2026-07-30 came back
+  `approvalStatus: "Approved"` with `approvedAt == createdAt`, as do all 15 production
+  records — which is what that equality on every one of them was telling us.
+
+  So the flow is upload → create (approved, explicitly requested) → **verify**, and the
+  read-back is a gate: `advanceApproveFlow` records the terminal `approved` stage only if
+  Prime says `Approved`, otherwise it audits `pipeline.ap_invoice_not_approved` and
+  throws, leaving the invoice at `ap_created` to be re-verified next tick. `approved`
+  moves the message to `Processed`, i.e. it tells the accounts team the invoice is done —
+  so it must never be recorded on Prime's behalf. `approvalStatus` is sent on the create
+  rather than left to Prime's default for the same reason: approving is the pipeline's
+  entire purpose, and if it happened only as a side effect of someone else's default, a
+  changed default or an API user without approval rights would silently produce
+  unapproved payables.
+
+  **Approval does not trigger the Xero push, and that is known rather than suspected.**
+  Read off all 15 production AP invoices on 2026-07-29: the one record at
+  `approvalStatus: "Approved"` with its lifecycle status still `New` has never synced in
+  two years — which is exactly the state this code leaves an invoice in (confirmed again
+  by both 2026-07-30 records: `isSynced: false`). All 12 synced records are at
   `accountsPayableInvoiceStatus: "Paid"`, and were updated in a *batch* (identical
-  `updatedAt` and `version` across records created a day apart), i.e. by a payment
-  run rather than by anything approval did. `approvedAt` equals `createdAt` on all
-  15, so approval was never a separate transition at all.
+  `updatedAt` and `version` across records created a day apart), i.e. by a payment run
+  rather than by anything approval did.
 
   The mechanism to change the lifecycle status is
   `PATCH /accounts-payable-invoices/{id}/relationships/accountsPayableInvoiceStatus`
@@ -428,7 +618,11 @@ covered by **no test** — `npm run pipeline:sample` is the only thing that
 exercises them, which is part of why it exists. Live write-path tests against
 `PRIME_TEST_WORK_ORDER_IDS` are run separately and manually, requiring the
 sign-off/cleanup steps in the implementation plan — do not wire these into the
-automated suite.
+automated suite. `docs/end-to-end-test-runbook.md` is the procedure for one:
+reset → set the mode → move the emails to `Retry` → `tick:once` →
+`discover:prime -- --verify` → tell Builderwest. It also lists the paths no run
+covers yet (`Exceptions/Unreadable`, the auto-reply, large attachments,
+storm-day volume).
 
 **Keep the Prime stubs keyed, not blanket.** Both format bridges are invisible to
 a stub that ignores its argument: an unkeyed `findContactsByAbn` makes the

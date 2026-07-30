@@ -86,3 +86,9 @@ pipeline tests exercise the full flow without ever calling a Prime write endpoin
 Live write-path tests against the dedicated Prime test work order are run
 separately and manually — see the plan's build sequence for the required
 sign-off and cleanup steps before those are ever run.
+
+**[docs/end-to-end-test-runbook.md](docs/end-to-end-test-runbook.md)** is the
+step-by-step procedure for a full run: the four test layers and what each covers,
+how to reset local state so the same invoices can be re-run (and why dragging the
+email to `Retry` is not a substitute after a dry run), the trigger, and how to
+verify in Prime afterwards.

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { loadEnv } from "../../config/env.js";
 import { PRIME_ATTACHMENT_STATUS, PRIME_ATTACHMENT_OBJECT_TYPE } from "../../config/constants.js";
 import { logger } from "../../log/logger.js";
-import { primeRequest } from "./httpClient.js";
+import { primeRequest, primeWriteBody } from "./httpClient.js";
 import { appendAuditLog } from "../../db/repositories/auditLog.js";
 import type { AuditContext } from "./workOrders.js";
 
@@ -28,11 +28,18 @@ export interface UploadAttachmentInput {
  * the AP invoice then references (PRD §5.1 — "attachment must exist before the
  * invoice references it").
  *
- * Shape verified against production on 2026-07-28 by reading the attachments
- * real AP invoices already carry: JSON rather than multipart, `file` as base64,
- * `attachmentStatus: "Published"`, and `objectType: "Job"` with `objectId` equal
- * to the AP invoice's own jobId on every one of them. The earlier multipart form
- * was a guess and would have been rejected.
+ * Field set taken from the docs and cross-checked on 2026-07-28 against the
+ * attachments real AP invoices already carry: `attachmentStatus: "Published"` and
+ * `objectType: "Job"` with `objectId` equal to the AP invoice's own jobId on every
+ * one of them. The earlier multipart form was a guess and would have been rejected.
+ *
+ * WHAT THAT CROSS-CHECK COULD NOT SEE, and it cost a live run on 2026-07-30:
+ * reading a STORED resource tells you the storage shape, never the accepted
+ * REQUEST shape. The stored attachment has no `file` field at all — it has `url`,
+ * `mimeType` and `size`, all server-derived — so "JSON with `file` as base64" was
+ * an inference dressed up as a verification. The fields also have to be nested
+ * under `attributes` (see primeWriteBody), which no amount of reading stored
+ * records would ever have revealed. Flat, they 500.
  *
  * Size note: Prime's single-POST limit is 25 MB and base64 inflates ~33%, so
  * ~18 MB of PDF. Graph's inline-attachment fetch gives out well before that, so
@@ -77,7 +84,7 @@ export async function uploadAttachment(
   const response = await primeRequest<PrimeAttachmentApiResponse>({
     method: "POST",
     path: "/attachments",
-    body,
+    body: primeWriteBody(body),
   });
 
   appendAuditLog({

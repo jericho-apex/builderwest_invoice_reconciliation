@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { PRIME_AP_INVOICE_INITIAL_STATUS } from "../../config/constants.js";
 import { loadEnv } from "../../config/env.js";
 import { logger } from "../../log/logger.js";
-import { primeRequest } from "./httpClient.js";
+import { primeRequest, primeWriteBody } from "./httpClient.js";
 import { appendAuditLog } from "../../db/repositories/auditLog.js";
 import { DRY_RUN_ID_PREFIX } from "./attachments.js";
 import type { AuditContext } from "./workOrders.js";
@@ -95,11 +96,74 @@ export async function createApInvoice(
   const body = {
     invoiceNumber: input.invoiceNumber,
     jobId: input.jobId,
+    // `workOrderId` ALONE, and the sibling `workOrder` deliberately not sent.
+    //
+    // This used to send both, on the belief that Prime required both. It does not:
+    // they are an either/or pair, stated the same way by the docs and by the live
+    // empty-body 422 of 2026-07-30.
+    //
+    //   workOrderId  "Work Order Id - required if attributes.workOrder is not presented"
+    //   workOrder    "Work Order Number - required if attributes.workOrderId is not presented"
+    //
+    // An empty body trips both halves of an either/or at once, and the two errors
+    // arriving side by side are what got read as "both required".
+    //
+    // `workOrderId` is the right half to send. `workOrder` wants the work-order
+    // NUMBER — the PO label — and the line removed here was passing it a UUID, which
+    // the validator accepted only because it checks for a string rather than a valid
+    // reference. 15/15 production records store `workOrderId`; none store `workOrder`.
     workOrderId: input.workOrderId,
     attachmentId: input.attachmentId,
     amount: fromCents(input.totalAmountCents),
     invoicedDate: input.invoicedDate,
     dueDate: input.dueDate,
+    // THE FIELD WHOSE ABSENCE CRASHED PRIME. Two live runs on 2026-07-30 failed every
+    // approvable invoice on `POST /accounts-payable-invoices -> 500`, body
+    // `{"message":"Attempt to read property \"name\" on null"}` — a null dereference
+    // inside Prime's handler, with no field named. The docs name it:
+    //
+    //   accountsPayableInvoiceStatusId  "required if attributes.accountsPayableInvoiceStatus
+    //                                    is not presented"
+    //   accountsPayableInvoiceStatus    "Accounts Payable Invoice Status Name - required if
+    //                                    attributes.accountsPayableInvoiceStatusId is not presented"
+    //
+    // Neither half was being sent, and the half named here carries a status NAME —
+    // exactly the property the crash dereferenced on null.
+    //
+    // The NAME half rather than the id: there is no status-list endpoint to resolve an
+    // id from (`/accounts-payable-invoice-statuses` returns 404, checked live), so an
+    // id could only be invented, while the name is an accepted string input.
+    //
+    // AND THE LESSON, because it cost three live runs across two days: Prime's live
+    // validator does NOT enforce this pair. The empty-body 422 lists seven required
+    // fields and no status at all, so the docs are STRICTER than the validator here —
+    // the exact reverse of `workOrderId`, which the docs call optional and production
+    // requires. Neither source is authoritative on its own, and a required field the
+    // validator ignores surfaces as a 500 with no signal rather than a 422 that names it.
+    accountsPayableInvoiceStatus: PRIME_AP_INVOICE_INITIAL_STATUS,
+    /**
+     * THE APPROVAL, and it happens HERE rather than in a second call.
+     *
+     * There is no separate approve write any more: `PATCH /accounts-payable-invoices/{id}`
+     * answers **405 "Endpoint not currently available"** (live, 2026-07-30 — it was the
+     * step that failed once the create started working). The docs offer
+     * `PUT /accounts-payable-invoices/{id}` with the record's `version` instead, but
+     * that is replace-semantics on a live payable and it is not needed: Prime creates
+     * an AP invoice **already approved**. Both records created on 2026-07-30 came back
+     * `approvalStatus: "Approved"`, `approvedAt == createdAt`, and so did all 15
+     * production records — which is what that equality on every one of them meant.
+     *
+     * So the field is sent explicitly rather than left to Prime's default. Approving is
+     * the pipeline's entire purpose; if it happened only as a side effect of Prime's
+     * defaults, then a changed default or an API user without approval rights would
+     * silently create unapproved payables and nothing would notice. Stating it also
+     * closes the window the old two-write flow had, where a crash between create and
+     * approve left a payable in Prime that no one had approved.
+     *
+     * `advanceApproveFlow` VERIFIES it via `readBackApInvoice` before recording the
+     * invoice as approved, so this is a request, not an assumption.
+     */
+    approvalStatus: "Approved",
   };
 
   if (env.PRIME_DRY_RUN) {
@@ -116,7 +180,7 @@ export async function createApInvoice(
   const response = await primeRequest<PrimeApInvoiceApiResponse>({
     method: "POST",
     path: "/accounts-payable-invoices",
-    body,
+    body: primeWriteBody(body),
   });
 
   appendAuditLog({
@@ -129,50 +193,28 @@ export async function createApInvoice(
 }
 
 /**
- * Sets the AP invoice's approval status to Approved, which triggers Prime's
- * existing hook to push the invoice to Xero (PRD §4.1/§4.3 — Apex never
- * calls Xero directly).
+ * THERE IS NO SEPARATE APPROVE CALL. `approveApInvoice` used to live here, doing
+ * `PATCH /accounts-payable-invoices/{id}` with `{ approvalStatus: "Approved" }`. It is
+ * gone because that endpoint does not exist: **405 "Endpoint not currently
+ * available"** (live, 2026-07-30). Approval is requested on the create instead — see
+ * `approvalStatus` in `createApInvoice` — and verified by `readBackApInvoice`.
  *
- * THIS IS THE PIPELINE'S LAST PRIME WRITE, and it deliberately does not chase the
- * Xero push any further. Decided with Builderwest 2026-07-29.
+ * THE XERO PUSH, kept here because it is the reason the pipeline stops where it does
+ * (decided with Builderwest 2026-07-29):
  *
- * Setting `approvalStatus` does NOT trigger Prime's push to Xero — read off all 15
- * production AP invoices: one has sat at `approvalStatus: "Approved"` with its
- * lifecycle status still `New`, unsynced, since December 2023, which is exactly the
- * state this call leaves an invoice in. The 12 that did sync are all
- * `accountsPayableInvoiceStatus: "Paid"` and were updated in a batch, i.e. by a
- * payment run.
+ * Approval does NOT trigger Prime's push to Xero. Of the 15 production AP invoices,
+ * one has sat at `approvalStatus: "Approved"` with its lifecycle status still `New`
+ * and unsynced since December 2023 — exactly the state this pipeline leaves an invoice
+ * in. The 12 that did sync are all `accountsPayableInvoiceStatus: "Paid"` and were
+ * updated in a batch, i.e. by a payment run.
  *
  * Reaching a synced state would mean PATCHing
  * `/accounts-payable-invoices/{id}/relationships/accountsPayableInvoiceStatus` to
- * "Paid" (that route exists — a GET returns 405, not 404 — and needs the record's
- * `version`). That asserts payment before payment has happened, so it is NOT done
- * here and must not be added without written sign-off from Builderwest. Their
- * finance process pushes to Xero when it pays, as it always did.
+ * "Paid" — that route is real and PATCH-only (a GET returns 405, not 404) and needs
+ * the record's `version`. It asserts payment before payment has happened, so it is
+ * NOT done here and must not be added without written sign-off from Builderwest.
+ * Their finance process pushes to Xero when it pays, as it always did.
  */
-export async function approveApInvoice(apInvoiceId: string, context: AuditContext): Promise<void> {
-  if (isDryRunId(apInvoiceId)) {
-    logger.info("[dry-run] would approve AP invoice in Prime", { apInvoiceId });
-    appendAuditLog({
-      ...context,
-      eventType: "prime.approve_ap_invoice.dry_run",
-      detail: { apInvoiceId },
-    });
-    return;
-  }
-
-  await primeRequest<void>({
-    method: "PATCH",
-    path: `/accounts-payable-invoices/${apInvoiceId}`,
-    body: { approvalStatus: "Approved" },
-  });
-
-  appendAuditLog({
-    ...context,
-    eventType: "prime.approve_ap_invoice",
-    detail: { apInvoiceId },
-  });
-}
 
 /**
  * Reads the AP invoice back after approving it. OBSERVATION, NOT A GATE — the

@@ -10,6 +10,7 @@ import { recordMatchResult } from "../db/repositories/matchResults.js";
 import { appendAuditLog } from "../db/repositories/auditLog.js";
 import { logger } from "../log/logger.js";
 import { dollarsToCents } from "../lib/money.js";
+import { describeError } from "../lib/prime/httpClient.js";
 import { getPdfAttachments } from "../lib/graph/mailbox.js";
 import type { GraphMessageSummary } from "../lib/graph/mailbox.js";
 import { classifyMessage } from "../lib/extraction/classifyMessage.js";
@@ -260,11 +261,15 @@ export async function driveInvoice(invoiceId: number): Promise<void> {
 
     await advanceApproveFlow(invoiceId, context);
   } catch (error) {
-    logger.error("unhandled error driving invoice", { invoiceId, error: String(error) });
+    // describeError, not String(error): a Prime failure's status and response body
+    // are the whole diagnostic — a 500's opaque correlation id is what Prime support
+    // needs, and a 422's body names the offending fields. See describeError.
+    const detail = describeError(error);
+    logger.error("unhandled error driving invoice", { invoiceId, ...detail });
     appendAuditLog({
       ...context,
       eventType: "pipeline.unhandled_error",
-      detail: { error: String(error) },
+      detail,
       isError: true,
     });
     // Leave the invoice at its current stage — the next tick's in-flight

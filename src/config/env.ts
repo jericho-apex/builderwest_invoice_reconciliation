@@ -110,6 +110,18 @@ const envSchema = z.object({
   GRAPH_SEND_MAIL_ENABLED: boolFromString.default("false"),
   GRAPH_TEST_RECIPIENT: z.string().optional(),
 
+  // The outbound-email equivalent of PRIME_TEST_WORK_ORDER_IDS, and it defaults
+  // to ON for the same reason: the pilot mailbox is live and the sample invoices
+  // are from REAL subcontractors, so the auto-reply's natural recipient (the
+  // message sender) is a real trade business. When true, every auto-reply is
+  // redirected to GRAPH_TEST_RECIPIENT with the intended address preserved in the
+  // audit row and stated in the email itself.
+  //
+  // Set it to false only at go-live, when replies are supposed to reach suppliers.
+  // Unlike a Prime write, an email cannot be voided after the fact — which is why
+  // the safe value is the default rather than something to remember to turn on.
+  GRAPH_SEND_MAIL_REDIRECT_TO_TEST: boolFromString.default("true"),
+
   // OpenRouter (AI extraction/classification, targeting a Claude model)
   OPENROUTER_API_KEY: z.string().min(1),
   OPENROUTER_MODEL: z.string().min(1).default("anthropic/claude-sonnet-4.5"),
@@ -153,6 +165,9 @@ export function loadEnv(): Env {
     );
   }
 
+  // Required whenever outbound mail is on, not just when the redirect is: it is
+  // the address the redirect sends to, and requiring it unconditionally means
+  // turning the redirect back ON is never blocked by a missing value.
   if (parsed.data.GRAPH_SEND_MAIL_ENABLED && !parsed.data.GRAPH_TEST_RECIPIENT) {
     throw new Error(
       "GRAPH_SEND_MAIL_ENABLED is true but GRAPH_TEST_RECIPIENT is not set — " +
@@ -175,6 +190,16 @@ export function loadEnv(): Env {
       "PRIME_DRY_RUN=false with an EMPTY PRIME_TEST_WORK_ORDER_IDS — live Prime " +
         "writes are enabled for EVERY matched work order, not just test ones. " +
         "This is correct only at go-live; during pilot testing set the allowlist.",
+    );
+  }
+
+  // Same shape, same reasoning, different blast radius: this one reaches people
+  // outside the company and cannot be undone once sent.
+  if (cachedEnv.GRAPH_SEND_MAIL_ENABLED && !cachedEnv.GRAPH_SEND_MAIL_REDIRECT_TO_TEST) {
+    logger.warn(
+      "GRAPH_SEND_MAIL_ENABLED=true with GRAPH_SEND_MAIL_REDIRECT_TO_TEST=false — " +
+        "auto-replies will be sent to the REAL sender of each invoice, which during " +
+        "the pilot means real subcontractors. This is correct only at go-live.",
     );
   }
 
